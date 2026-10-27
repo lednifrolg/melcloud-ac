@@ -8,16 +8,85 @@ and controls a real device on a real account.
 
 ## Status
 
-The command line and the interactive TUI both show and control the unit. Shell completions, a
-man page and release binaries are next.
-The API has been verified live for login, device listing, reading unit state and changing the
-target temperature.
+The command line and the interactive TUI both show and control the unit. The API has been
+verified live for login, device listing, reading the unit's state and every kind of command.
+klima runs on Linux and macOS; Windows is not supported.
+
+## Install
+
+Prebuilt binaries for Linux (x86_64 and aarch64, static) and macOS 11 or later (Apple silicon
+and Intel) are on the [releases page](https://github.com/lednifrolg/melcloud-ac/releases). In
+bash or zsh, this picks the one for the machine from the latest release and checks it against
+the release's checksums:
+
+```sh
+case "$(uname -sm)" in
+  "Linux x86_64") target=x86_64-unknown-linux-musl ;;
+  "Linux aarch64") target=aarch64-unknown-linux-musl ;;
+  "Darwin arm64") target=aarch64-apple-darwin ;;
+  "Darwin x86_64") target=x86_64-apple-darwin ;;
+  *) target=none; echo "no prebuilt klima for $(uname -sm); build it from source" ;;
+esac
+latest=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/lednifrolg/melcloud-ac/releases/latest)
+tag=${latest##*/}
+cd "$(mktemp -d)"
+url="https://github.com/lednifrolg/melcloud-ac/releases/download/$tag"
+[ "$target" != none ] &&
+curl -fsSLO "$url/klima-$target.tar.gz" &&
+curl -fsSLO "$url/SHA256SUMS" &&
+grep " klima-$target.tar.gz\$" SHA256SUMS > checksum &&
+if command -v sha256sum > /dev/null; then sha256sum -c checksum; else shasum -a 256 -c checksum; fi ||
+rm -f "klima-$target.tar.gz"
+```
+
+An archive that fails the check is deleted, so the steps below cannot install it. The
+checksums come from the same release, so they catch a broken download, not a tampered
+release. With the GitHub CLI logged in, this checks that the archive was built from that tag
+by this repository's release workflow, and deletes it otherwise:
+
+```sh
+gh attestation verify "klima-$target.tar.gz" --repo lednifrolg/melcloud-ac \
+  --cert-identity "https://github.com/lednifrolg/melcloud-ac/.github/workflows/release.yml@refs/tags/$tag" \
+  --deny-self-hosted-runners ||
+rm -f "klima-$target.tar.gz"
+```
+
+Then, in the same terminal, this installs it into `~/.local/bin`:
+
+```sh
+tar -xzf "klima-$target.tar.gz" &&
+mkdir -p ~/.local/bin &&
+install -m 755 "klima-$target/klima" ~/.local/bin/ &&
+~/.local/bin/klima --version &&
+type klima
+```
+
+The last line should say `klima is` followed by the path in `~/.local/bin`. If klima is not
+found, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`, or for bash to `~/.bashrc`
+(`~/.bash_profile` on macOS), and open a new terminal. If it names another file, an older klima
+comes first on PATH; remove it, with `cargo uninstall klima` for one built from source. The same
+commands update klima. Other systems, like a 32-bit Raspberry Pi, build from source (below). The
+archive also holds shell completions in `completions/` and man pages in `man/man1/`, the same
+files `klima completions` and `klima man` write (see [Usage](#usage)).
+
+The installed binary is attested as well, so it can be checked later from any terminal,
+without running it:
+
+```sh
+gh attestation verify ~/.local/bin/klima --repo lednifrolg/melcloud-ac \
+  --cert-identity-regex '^https://github\.com/lednifrolg/melcloud-ac/\.github/workflows/release\.yml@refs/tags/v' \
+  --deny-self-hosted-runners
+```
+
+On macOS, a binary downloaded with a browser instead is quarantined and refused as unverified;
+`xattr -d com.apple.quarantine ~/.local/bin/klima` lifts that.
+
+From source, with a recent Rust from [rustup](https://rustup.rs), for a release like `v0.1.0`:
+`cargo install --git https://github.com/lednifrolg/melcloud-ac --tag v0.1.0 --locked klima`.
 
 ## Usage
 
 ```sh
-cargo install --path crates/klima
-
 klima                  # the interactive TUI
 klima login            # asks for email and password; stores only the session
 klima devices          # devices on the account (cached for a day, --fresh to ask again)
@@ -35,14 +104,36 @@ klima set --power on --mode heat --temp 21 --fan auto   # several changes, one c
 klima logout
 ```
 
-Shell completions and man pages come from the binary itself:
+Shell completions and man pages come from the binary itself; run the line for your shell, and
+again after updating klima. For bash, with the bash-completion package installed:
 
 ```sh
-klima completions zsh > ~/.zfunc/_klima          # also bash, fish, elvish, powershell
-klima completions bash > ~/.local/share/bash-completion/completions/klima
-klima completions fish > ~/.config/fish/completions/klima.fish
-klima man ~/.local/share/man/man1                # then `man klima`, `man klima-set`
+mkdir -p ~/.local/share/bash-completion/completions && klima completions bash > ~/.local/share/bash-completion/completions/klima
 ```
+
+For zsh:
+
+```sh
+mkdir -p ~/.zfunc && klima completions zsh > ~/.zfunc/_klima
+```
+
+and in `~/.zshrc`, `fpath=(~/.zfunc $fpath)` before `compinit` runs (with oh-my-zsh, before
+`source $ZSH/oh-my-zsh.sh`). A `~/.zshrc` with neither, as on a fresh macOS, needs
+`fpath=(~/.zfunc $fpath); autoload -Uz compinit && compinit`. For fish:
+
+```sh
+mkdir -p ~/.config/fish/completions && klima completions fish > ~/.config/fish/completions/klima.fish
+```
+
+elvish and PowerShell work the same way. The man pages, for `man klima`, `man klima-set` and the
+other commands:
+
+```sh
+klima man ~/.local/share/man/man1
+```
+
+man finds them while `~/.local/bin` is on PATH; otherwise `export MANPATH="$HOME/.local/share/man:"`
+in the shell's startup file helps.
 
 A command is checked against what the unit supports and what the account may change before
 anything is sent, leaves out settings the unit already has, and goes out as one MELCloud
