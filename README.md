@@ -8,8 +8,8 @@ and controls a real device on a real account.
 
 ## Status
 
-The command line and the interactive TUI both show and control the unit. Animations and a
-richer history chart are next.
+The command line and the interactive TUI both show and control the unit. Shell completions, a
+man page and release binaries are next.
 The API has been verified live for login, device listing, reading unit state and changing the
 target temperature.
 
@@ -47,15 +47,20 @@ With several devices, pick one with `--device <name or ID>` or set it in
 email = "user@example.com"   # offered by `klima login`
 device = "Living room"
 refresh_minutes = 10         # automatic refresh in the TUI, at least 5
+animations = true            # spinning fan, swinging vanes, flashing digits in the TUI
 ```
 
 ### TUI
 
 `klima` without a command opens a dashboard: the unit's settings with big digits and a
-temperature scale, the weather at the building, the adapter's WiFi and last contact, the room
-temperature of the last 24 hours and an activity log. It refreshes on its own every 10 minutes
-within the request budget, shows the countdown and the budget in the status line, and picks up
-changes made by `klima` commands in other terminals at once.
+temperature scale, the weather at the building, the adapter's WiFi and last contact, a chart of
+the last 24 hours and an activity log. The chart draws the room temperature over clock hours with
+a band underneath for when the unit was off or running and in which mode; it is built from every
+read of the unit, by the TUI and by commands alike, and leaves gaps where nothing was read. The
+TUI refreshes on its own every 10 minutes within the request budget, shows the countdown and the
+budget in the status line, and picks up changes made by `klima` commands in other terminals at
+once. While the unit runs, the fan turns at its speed and swinging vanes sweep; set
+`animations = false` for a still screen.
 
 To change the unit, select a setting with `↑`/`↓` (or `k`/`j`) and change it with `←`/`→` (or
 `h`/`l`), or use `+`/`-` for the temperature, `m` mode, `f` fan, `s`/`S` swing and `P` power. The

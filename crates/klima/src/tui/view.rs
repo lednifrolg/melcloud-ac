@@ -1,20 +1,29 @@
 //! Drawing the TUI from the model.
 
-use jiff::SignedDuration;
+use std::fmt::Display;
+
 use jiff::civil::Date;
 use jiff::civil::DateTime;
-use melcloud::{AtaView, Capabilities, WeatherKind, WeatherObservation};
+use jiff::{RoundMode, SignedDuration, Timestamp, Unit, ZonedRound};
+use melcloud::{
+    AtaView, Capabilities, FanSpeed, VaneHorizontal, VaneVertical, WeatherKind, WeatherObservation,
+};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Sparkline, Wrap};
+use ratatui::widgets::{
+    Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, Padding, Paragraph, Wrap,
+};
 
 use super::keymap::{BINDINGS, Hint};
 use super::model::{
-    Busy, Flight, LoginForm, Model, NOTICE_SHOWN, Overlay, Phase, Row, TABS, Target, Tone, rows,
+    Busy, Flight, LoginForm, Model, NOTICE_SHOWN, Overlay, Phase, Quit, Row, TABS, Target, Tone,
+    rows,
 };
-use super::widgets::{BIG_TEXT_HEIGHT, BigText, scale};
+use super::widgets::{BIG_TEXT_HEIGHT, BigText, cell, scale};
+use crate::cache::Sample;
 use crate::control;
 use crate::governor::HOURLY_LIMIT;
 use crate::output::{ago, duration};
@@ -32,6 +41,14 @@ const BUSY: Color = Color::Indexed(6);
 /// Background of the selected control row.
 const SELECTED: Color = Color::Indexed(8);
 const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// The big digits for a moment after the target changed.
+const FLASHED: Style = Style::new()
+    .fg(Color::Indexed(15))
+    .add_modifier(Modifier::BOLD);
+/// A turning fan.
+const FAN: [char; 6] = ['◜', '◠', '◝', '◞', '◡', '◟'];
+/// Time a swinging vane takes from one position to the next.
+const SWING_STEP: i64 = 250;
 
 /// A screen area the mouse can point at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,7 +217,9 @@ fn control(model: &Model, frame: &mut Frame, area: Rect, spots: &mut Vec<Hotspot
         Constraint::Length(2),
     ])
     .areas(inner);
-    temperature(&view, tone, frame, digits_row, spots);
+    let flashing = model.flash_until.is_some_and(|until| until > model.now);
+    let digits_style = if flashing { FLASHED } else { tone };
+    temperature(&view, tone, digits_style, frame, digits_row, spots);
 
     let Some(caps) = device.and_then(|d| d.capabilities.as_ref()) else {
         return;
@@ -224,7 +243,7 @@ fn control(model: &Model, frame: &mut Frame, area: Rect, spots: &mut Vec<Hotspot
         view.mode, range.min, range.max, caps.temperature_step
     );
     frame.render_widget(Line::styled(legend, DIM), legend_line);
-    control_rows(model.row, &view, caps, color, frame, rows_area, spots);
+    control_rows(model, &view, caps, color, frame, rows_area, spots);
     command_status(model, frame, status_area);
 }
 
@@ -232,6 +251,7 @@ fn control(model: &Model, frame: &mut Frame, area: Rect, spots: &mut Vec<Hotspot
 fn temperature(
     view: &AtaView,
     tone: Style,
+    digits_style: Style,
     frame: &mut Frame,
     area: Rect,
     spots: &mut Vec<Hotspot>,
@@ -239,7 +259,7 @@ fn temperature(
     let target = format!("{:.1}", view.target_temperature);
     let digits = BigText {
         text: &target,
-        style: tone,
+        style: digits_style,
     };
     let [digits_area, _, side_area] = Layout::horizontal([
         Constraint::Length(digits.width()),
@@ -276,8 +296,27 @@ fn temperature(
 const MARKER: u16 = 2;
 const LABEL: u16 = 8;
 
+/// A setting's name, as wide as the others.
+fn label(text: &str) -> Span<'static> {
+    Span::styled(format!("{text:<width$}", width = usize::from(LABEL)), DIM)
+}
+
+/// A vane row: the five positions, the marked ones in `tone`, and the setting.
+fn vane(name: &str, marks: [bool; 5], setting: impl Display, tone: Style) -> Vec<Span<'static>> {
+    let mut spans = vec![label(name)];
+    spans.extend(marks.map(|on| {
+        if on {
+            Span::styled("●", tone)
+        } else {
+            Span::styled("∙", DIM)
+        }
+    }));
+    spans.push(format!(" {setting}").into());
+    spans
+}
+
 fn control_rows(
-    selected: Row,
+    model: &Model,
     view: &AtaView,
     caps: &Capabilities,
     color: Option<Color>,
@@ -285,18 +324,9 @@ fn control_rows(
     area: Rect,
     spots: &mut Vec<Hotspot>,
 ) {
+    let selected = model.row;
+    let moving = model.moving();
     let tone = color.map_or(DIM, |c| Style::new().fg(c));
-    let label =
-        |text: &str| Span::styled(format!("{text:<width$}", width = usize::from(LABEL)), DIM);
-    let marks = |marks: [bool; 5]| {
-        marks.map(|on| {
-            if on {
-                Span::styled("●", tone)
-            } else {
-                Span::styled("∙", DIM)
-            }
-        })
-    };
     let mut specific = Vec::new();
     for (row, y) in rows(caps).into_iter().zip(area.y..area.bottom()) {
         let x = area.x + MARKER + LABEL;
@@ -326,7 +356,17 @@ fn control_rows(
                 spans
             }
             Row::Fan => {
-                let mut spans = vec![label("fan")];
+                let mut spans = if moving {
+                    let glyph = fan_glyph(view.fan_speed, caps.fan_levels, model.now);
+                    // The turning fan fits in the label, so the bars stay in line with the rest.
+                    vec![
+                        Span::styled("fan ", DIM),
+                        Span::styled(glyph.to_string(), tone),
+                        "   ".into(),
+                    ]
+                } else {
+                    vec![label("fan")]
+                };
                 for (level, bar_x) in (1..=caps.fan_levels).zip(x..) {
                     let lit = theme::fan_bar_lit(level, view.fan_speed);
                     let bar = theme::fan_bar(level, caps.fan_levels).to_string();
@@ -344,18 +384,23 @@ fn control_rows(
                 });
                 spans
             }
-            Row::VaneVertical => [
-                vec![label("vane ↕")],
-                marks(theme::vertical_marks(view.vane_vertical)).to_vec(),
-                vec![format!(" {}", view.vane_vertical).into()],
-            ]
-            .concat(),
-            Row::VaneHorizontal => [
-                vec![label("vane ↔")],
-                marks(theme::horizontal_marks(view.vane_horizontal)).to_vec(),
-                vec![format!(" {}", view.vane_horizontal).into()],
-            ]
-            .concat(),
+            Row::VaneVertical => {
+                let marks = if moving && view.vane_vertical == VaneVertical::Swing {
+                    swing(model.now, 0)
+                } else {
+                    theme::vertical_marks(view.vane_vertical)
+                };
+                vane("vane ↕", marks, view.vane_vertical, tone)
+            }
+            Row::VaneHorizontal => {
+                // Half a sweep behind the vertical vane, so the two do not move in step.
+                let marks = if moving && view.vane_horizontal == VaneHorizontal::Swing {
+                    swing(model.now, 4)
+                } else {
+                    theme::horizontal_marks(view.vane_horizontal)
+                };
+                vane("vane ↔", marks, view.vane_horizontal, tone)
+            }
         };
         let line_area = Rect::new(area.x, y, area.width, 1);
         spots.push(Hotspot {
@@ -379,6 +424,30 @@ fn control_rows(
         frame.render_widget(line, line_area);
     }
     spots.extend(specific);
+}
+
+/// The fan glyph at `now`: turning faster at higher speeds, at a middle speed in auto.
+fn fan_glyph(fan: FanSpeed, levels: u8, now: Timestamp) -> char {
+    let level = match fan {
+        FanSpeed::Level(level) => level.min(levels),
+        FanSpeed::Auto | FanSpeed::Other(_) => levels.div_ceil(2),
+    };
+    // One step per redraw at the top speed, five redraws at the lowest.
+    let step = 125 * i64::from(levels + 1 - level.max(1));
+    FAN[index(now.as_millisecond() / step, FAN.len())]
+}
+
+/// The position lit on a swinging vane at `now`: sweeping 1 to 5 and back, `offset` steps along.
+fn swing(now: Timestamp, offset: i64) -> [bool; 5] {
+    const SWEEP: [usize; 8] = [0, 1, 2, 3, 4, 3, 2, 1];
+    let lit = SWEEP[index(now.as_millisecond() / SWING_STEP + offset, SWEEP.len())];
+    std::array::from_fn(|i| i == lit)
+}
+
+/// `step` wrapped into `0..len`.
+fn index(step: i64, len: usize) -> usize {
+    let len = i64::try_from(len).unwrap_or(1);
+    usize::try_from(step.rem_euclid(len)).unwrap_or(0)
 }
 
 /// The two lines under the settings: waiting changes, a command on its way, or how the last one
@@ -413,7 +482,7 @@ fn command_status(model: &Model, frame: &mut Frame, area: Rect) {
         let filled = usize::try_from((millis(left) * 10).div_ceil(window))
             .unwrap_or(10)
             .min(10);
-        let headline = if model.quitting {
+        let headline = if model.quit == Quit::Asking {
             Line::from(vec![
                 Span::styled("QUIT? ", BOLD.fg(WARN)),
                 Span::styled("these changes are not sent yet", Style::new().fg(WARN)),
@@ -635,24 +704,14 @@ fn unit(model: &Model, frame: &mut Frame, area: Rect) {
     );
 }
 
-/// Tenths of a degree, for the sparkline.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    reason = "room temperatures above the day's minimum are small positive numbers"
-)]
-fn tenths(value: f64) -> u64 {
-    (value * 10.0).round().max(0.0) as u64
-}
+/// Time the history chart spans.
+const DAY: SignedDuration = SignedDuration::from_hours(24);
+/// Samples further apart are not joined: the unit was not read in between.
+const GAP: SignedDuration = SignedDuration::from_mins(45);
 
 fn history(model: &Model, frame: &mut Frame, area: Rect) {
-    let since = model.now - SignedDuration::from_hours(24);
-    let samples: Vec<f64> = model
-        .history
-        .iter()
-        .filter(|(at, _)| *at >= since)
-        .map(|(_, room)| *room)
-        .collect();
+    let since = model.now - DAY;
+    let samples: Vec<&Sample> = model.history.iter().filter(|s| s.at >= since).collect();
     let mut block = pane(title("History · 24 h"), MUTED);
     match samples.len() {
         0 => {}
@@ -672,33 +731,127 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let low = samples.iter().copied().fold(f64::INFINITY, f64::min);
-    let high = samples.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    let [labels, chart] =
-        Layout::horizontal([Constraint::Length(7), Constraint::Fill(1)]).areas(inner);
-    let [top, _, bottom] = Layout::vertical([
-        Constraint::Length(1),
+    let [plot_rows, ribbon_row, axis_row] = Layout::vertical([
         Constraint::Fill(1),
         Constraint::Length(1),
+        Constraint::Length(1),
     ])
-    .areas(labels);
-    frame.render_widget(Line::styled(format!("{high:.1}°"), DIM), top);
-    frame.render_widget(Line::styled(format!("{low:.1}°"), DIM), bottom);
-    // A margin above and below keeps the lowest sample visible and a flat day mid-height.
-    let margin = ((high - low) / 10.0).max(0.25);
-    let floor = low - margin;
-    // The newest sample sits at the right edge; empty bars fill the left when there are fewer
-    // samples than columns.
-    let width = usize::from(chart.width);
-    let shown = &samples[samples.len().saturating_sub(width)..];
-    let values: Vec<u64> = std::iter::repeat_n(0, width - shown.len())
-        .chain(shown.iter().map(|room| tenths(room - floor)))
+    .areas(inner);
+    let columns = Layout::horizontal([Constraint::Length(7), Constraint::Fill(1)]);
+    let [labels, plot] = columns.areas(plot_rows);
+    let [ribbon_label, ribbon] = columns.areas(ribbon_row);
+    let [_, axis] = columns.areas(axis_row);
+
+    let rooms = samples.iter().map(|s| s.room);
+    let low = rooms.clone().fold(f64::INFINITY, f64::min);
+    let high = rooms.fold(f64::NEG_INFINITY, f64::max);
+    let mut label_lines = vec![Line::default(); usize::from(labels.height)];
+    if let [first, .., last] = label_lines.as_mut_slice() {
+        *first = Line::styled(format!("{high:.1}°"), DIM);
+        *last = Line::styled(format!("{low:.1}°"), DIM);
+    }
+    if label_lines.len() >= 3 {
+        let middle = label_lines.len() / 2;
+        label_lines[middle] = Line::styled("room", DIM);
+    }
+    frame.render_widget(Paragraph::new(label_lines), labels);
+    frame.render_widget(Line::styled("mode", DIM), ribbon_label);
+
+    // Gaps without reads split the line.
+    let x = |at: Timestamp| at.duration_since(since).as_secs_f64();
+    let mut segments: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut previous: Option<Timestamp> = None;
+    for sample in &samples {
+        match segments.last_mut() {
+            Some(segment) if previous.is_some_and(|p| sample.at.duration_since(p) <= GAP) => {
+                segment.push((x(sample.at), sample.room));
+            }
+            _ => segments.push(vec![(x(sample.at), sample.room)]),
+        }
+        previous = Some(sample.at);
+    }
+    let datasets = segments
+        .iter()
+        .map(|points| {
+            Dataset::default()
+                .marker(Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(Style::new().fg(Color::Indexed(4)))
+                .data(points)
+        })
         .collect();
-    let sparkline = Sparkline::default()
-        .data(&values)
-        .max(tenths(high + margin - floor))
-        .style(Style::new().fg(Color::Indexed(4)));
-    frame.render_widget(sparkline, chart);
+    // About a braille dot above and below, so the extremes land on the rows of their labels and a
+    // flat day runs mid-height.
+    let margin = ((high - low) / (f64::from(plot.height) * 4.0)).max(0.05);
+    let chart = Chart::new(datasets)
+        .x_axis(Axis::default().bounds([0.0, DAY.as_secs_f64()]))
+        .y_axis(Axis::default().bounds([low - margin, high + margin]))
+        .legend_position(None);
+    frame.render_widget(chart, plot);
+    frame.render_widget(mode_ribbon(&samples, since, ribbon.width), ribbon);
+    frame.render_widget(time_axis(model, axis.width), axis);
+}
+
+/// One cell per column of the chart: the mode the unit ran in, a dot while it was off, nothing
+/// while it was not read.
+fn mode_ribbon(samples: &[&Sample], since: Timestamp, width: u16) -> Line<'static> {
+    let column = DAY / i32::from(width.max(1));
+    let cells = (0..width).map(|index| {
+        let start = since + column * i32::from(index);
+        let state = samples
+            .iter()
+            .rev()
+            .find(|s| s.at < start + column)
+            .filter(|s| start.duration_since(s.at) <= GAP);
+        match state {
+            Some(s) if s.power => Span::styled(
+                "▀",
+                Style::new().fg(Color::Indexed(theme::mode_color(s.mode))),
+            ),
+            Some(_) => Span::styled("·", DIM),
+            None => " ".into(),
+        }
+    });
+    Line::from(cells.collect::<Vec<_>>())
+}
+
+/// Clock hours under the chart, every 6 h where they fit, else every 12 h, with "now" at the
+/// right edge.
+fn time_axis(model: &Model, width: u16) -> Line<'static> {
+    let width = usize::from(width);
+    let every = if width >= 40 { 6 } else { 12 };
+    let since = model.now - DAY;
+    let last = width.saturating_sub(1);
+    let mut marks = vec![(last, "now".to_owned())];
+    let mut hour = since
+        .to_zoned(model.tz.clone())
+        .round(ZonedRound::new().smallest(Unit::Hour).mode(RoundMode::Ceil))
+        .ok();
+    while let Some(at) = hour.take().filter(|at| at.timestamp() < model.now) {
+        if at.hour() % every == 0 {
+            let share = at.timestamp().duration_since(since).as_secs_f64() / DAY.as_secs_f64();
+            marks.push((cell(share, last), at.strftime("%H:%M").to_string()));
+        }
+        hour = at.checked_add(SignedDuration::from_hours(1)).ok();
+    }
+    // Labels are centered on their time; from the right, one that would touch the label after it
+    // is left out, so "now" always shows.
+    marks[1..].sort_by_key(|&(center, _)| std::cmp::Reverse(center));
+    let mut text = vec![' '; width];
+    let mut limit = width;
+    for (center, label) in marks {
+        let start = center
+            .saturating_sub(label.len() / 2)
+            .min(width.saturating_sub(label.len()));
+        if start + label.len() > limit {
+            continue;
+        }
+        for (slot, glyph) in text[start..].iter_mut().zip(label.chars()) {
+            *slot = glyph;
+        }
+        limit = start.saturating_sub(1);
+    }
+    Line::styled(text.into_iter().collect::<String>(), DIM)
 }
 
 /// Splits `text` into lines of at most `width` characters at spaces; a longer word gets its own
@@ -762,7 +915,7 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
     let view = model.state.as_ref().map(|s| s.value.view());
     let color = view.and_then(mode_color).unwrap_or(Color::Indexed(7));
     let label = match (model.busy, &model.overlay) {
-        _ if model.quitting => "QUIT?",
+        _ if model.quit == Quit::Asking => "QUIT?",
         _ if model.pending.is_some() => "PENDING",
         _ if model.flight.is_some() => "SENDING",
         (Some(Busy::Login), _) | (_, Overlay::Login(_)) => "LOGIN",
@@ -866,7 +1019,7 @@ fn hint_bar(model: &Model, frame: &mut Frame, area: Rect, shape: Shape) {
             (0, "Esc", "cancel"),
         ],
         Overlay::Help => vec![(0, "?", "close")],
-        Overlay::None if model.quitting => {
+        Overlay::None if model.quit == Quit::Asking => {
             vec![
                 (0, "⏎", "send and quit"),
                 (0, "u", "discard and quit"),
@@ -1007,6 +1160,8 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
+    use melcloud::OperationMode;
+
     use super::*;
     use crate::tui::model::tests::{now, start, state};
     use crate::tui::model::{Msg, Start};
@@ -1024,11 +1179,22 @@ mod tests {
 
     /// A day of samples and some activity, as after a while of use.
     fn lived_in() -> Model {
-        let history = (0..48)
-            .map(|half_hours: i32| {
-                let at = now() - SignedDuration::from_mins(i64::from(30 * (48 - half_hours)));
-                let wave = f64::from((half_hours - 24).abs()) / 10.0;
-                (at, 21.0 + wave)
+        // Off overnight, not read for a while, then heating and lately cooling.
+        let history = (0..96)
+            .filter(|quarters| !(30..40).contains(quarters))
+            .map(|quarters: i32| {
+                let wave = f64::from((quarters - 48).abs()) / 20.0;
+                Sample {
+                    at: now() - SignedDuration::from_mins(i64::from(15 * (96 - quarters))),
+                    power: quarters >= 40,
+                    mode: if quarters < 80 {
+                        OperationMode::Heat
+                    } else {
+                        OperationMode::Cool
+                    },
+                    target: 22.0,
+                    room: 21.0 + wave,
+                }
             })
             .collect();
         let (mut model, _) = Model::start(Start { history, ..start() });
@@ -1143,6 +1309,49 @@ mod tests {
         assert_eq!(label(WeatherKind::Day, "2026-01-16T12:00"), "tomorrow");
         assert_eq!(label(WeatherKind::Night, "2026-01-17T03:00"), "tmrw night");
         assert_eq!(label(WeatherKind::Day, "2026-01-17T12:00"), "Sat");
+    }
+
+    #[test]
+    fn the_fan_turns_faster_at_higher_speeds() {
+        let glyphs = |fan, every: i64| {
+            (0..8)
+                .map(|step| {
+                    let at = Timestamp::from_millisecond(step * every).unwrap();
+                    fan_glyph(fan, 5, at)
+                })
+                .collect::<String>()
+        };
+        assert_eq!(glyphs(FanSpeed::Level(5), 125), "◜◠◝◞◡◟◜◠");
+        assert_eq!(glyphs(FanSpeed::Level(1), 625), "◜◠◝◞◡◟◜◠");
+        assert_eq!(glyphs(FanSpeed::Level(1), 125), "◜◜◜◜◜◠◠◠");
+        assert_eq!(glyphs(FanSpeed::Auto, 375), glyphs(FanSpeed::Level(3), 375));
+    }
+
+    #[test]
+    fn swinging_vanes_sweep_and_come_back() {
+        let lit = |step: i64, offset| {
+            let at = Timestamp::from_millisecond(step * SWING_STEP).unwrap();
+            swing(at, offset).iter().position(|&on| on).unwrap()
+        };
+        let sweep: Vec<usize> = (0..9).map(|step| lit(step, 0)).collect();
+        assert_eq!(sweep, [0, 1, 2, 3, 4, 3, 2, 1, 0]);
+        assert_eq!(lit(0, 4), 4, "half a sweep behind starts at the other end");
+    }
+
+    #[test]
+    fn the_time_axis_shows_clock_hours_up_to_now() {
+        let model = lived_in();
+        let axis = |width| time_axis(&model, width).to_string();
+        assert_eq!(axis(30), "12:00          00:00       now");
+        assert_eq!(
+            axis(12),
+            "12:00    now",
+            "an hour too close to now is left out"
+        );
+        assert_eq!(
+            axis(50),
+            "  12:00       18:00       00:00        06:00   now"
+        );
     }
 
     #[test]

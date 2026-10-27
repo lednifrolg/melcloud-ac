@@ -17,6 +17,8 @@ pub struct Config {
     pub device: Option<String>,
     /// Minutes between automatic refreshes in the TUI; at least 5.
     pub refresh_minutes: Option<u32>,
+    /// Motion in the TUI: a spinning fan, swinging vanes, flashing digits. On by default.
+    pub animations: Option<bool>,
 }
 
 /// Default and lowest refresh interval of the TUI, in minutes.
@@ -24,6 +26,10 @@ pub const REFRESH_MINUTES: u32 = 10;
 pub const MIN_REFRESH_MINUTES: u32 = 5;
 
 impl Config {
+    pub fn animations(&self) -> bool {
+        self.animations.unwrap_or(true)
+    }
+
     pub fn refresh_minutes(&self) -> u32 {
         self.refresh_minutes
             .unwrap_or(REFRESH_MINUTES)
