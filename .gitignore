@@ -1,0 +1,18 @@
+# Local-only research: API notes, app analysis, one-off scripts, captured responses. Never commit.
+/research/
+/out/
+
+# Design and review drafts
+/.lavish/
+
+# Secrets and local data
+credentials.json
+session.json
+*.xapk
+*.apk
+.env
+.env.*
+
+# Build output
+/target/
+__pycache__/
