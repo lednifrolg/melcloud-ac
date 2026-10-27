@@ -1,0 +1,195 @@
+[
+  {
+    "ID": 2000001,
+    "Name": "Example Home",
+    "City": "Example City",
+    "Country": 1,
+    "TimeZone": 1,
+    "CoolingDisabled": false,
+    "FPEnabled": false,
+    "HMEnabled": false,
+    "LinkToMELCloudHome": false,
+    "AccessLevel": 4,
+    "DirectAccess": true,
+    "Structure": {
+      "Floors": [
+        {
+          "ID": 5000001,
+          "Name": "Upstairs",
+          "Devices": [],
+          "Areas": [
+            {
+              "ID": 6000001,
+              "Name": "Bedrooms",
+              "Devices": [
+                {
+                  "DeviceID": 1000002,
+                  "DeviceName": "Bedroom",
+                  "BuildingID": 2000001,
+                  "FloorID": 5000001,
+                  "AreaID": 6000001,
+                  "AccessLevel": 2,
+                  "DirectAccess": false,
+                  "MacAddress": "02:00:00:00:00:02",
+                  "SerialNumber": "0000000002",
+                  "Type": 0,
+                  "Permissions": {
+                    "CanSetOperationMode": true,
+                    "CanSetFanSpeed": false,
+                    "CanSetVaneDirection": false,
+                    "CanSetPower": true,
+                    "CanSetTemperatureIncrementOverride": false,
+                    "CanDisableLocalController": false,
+                    "CanSetDemandSideControl": false
+                  },
+                  "Device": {
+                    "DeviceType": 0,
+                    "CanCool": true,
+                    "CanHeat": true,
+                    "CanDry": false,
+                    "CanAuto": false,
+                    "HasAutomaticFanSpeed": true,
+                    "NumberOfFanSpeeds": 4,
+                    "TemperatureIncrement": 1.0,
+                    "MinTempCoolDry": 18.0,
+                    "MaxTempCoolDry": 30.0,
+                    "MinTempHeat": 16.0,
+                    "MaxTempHeat": 30.0,
+                    "MinTempAutomatic": 18.0,
+                    "MaxTempAutomatic": 30.0,
+                    "ModelSupportsFanSpeed": true,
+                    "ModelSupportsAuto": false,
+                    "ModelSupportsHeat": true,
+                    "ModelSupportsDry": false,
+                    "ModelSupportsVaneVertical": true,
+                    "ModelSupportsVaneHorizontal": false,
+                    "ModelSupportsWideVane": false,
+                    "Power": false,
+                    "RoomTemperature": 19.0,
+                    "SetTemperature": 21.0,
+                    "OperationMode": 1,
+                    "FanSpeed": 0,
+                    "ActualFanSpeed": 0,
+                    "VaneVerticalDirection": 0,
+                    "VaneHorizontalDirection": 0,
+                    "EffectiveFlags": 0,
+                    "HasEnergyConsumedMeter": false,
+                    "CurrentEnergyConsumed": 0,
+                    "MqttFlags": 0,
+                    "WifiSignalStrength": -72,
+                    "WifiAdapterStatus": "NORMAL",
+                    "Offline": true,
+                    "LastTimeStamp": "2026-01-15T10:58:00",
+                    "ErrorCode": 8000,
+                    "HasError": false,
+                    "DeviceID": 1000002,
+                    "MacAddress": "02:00:00:00:00:02",
+                    "SerialNumber": "0000000002",
+                    "FirmwareAppVersion": 20000,
+                    "Units": [
+                      {
+                        "ID": 1,
+                        "Device": 0,
+                        "SerialNumber": null,
+                        "DeviceType": null,
+                        "ModelNumber": 1,
+                        "Model": "EXAMPLE-25",
+                        "UnitType": 1,
+                        "IsIndoor": true
+                      }
+                    ]
+                  }
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "Areas": [],
+      "Devices": [
+        {
+          "DeviceID": 1000001,
+          "DeviceName": "Living room",
+          "BuildingID": 2000001,
+          "BuildingName": null,
+          "FloorID": null,
+          "FloorName": null,
+          "AreaID": null,
+          "AreaName": null,
+          "AccessLevel": 4,
+          "DirectAccess": false,
+          "MacAddress": "02:00:00:00:00:01",
+          "SerialNumber": "0000000001",
+          "Type": 0,
+          "Permissions": {
+            "CanSetOperationMode": true,
+            "CanSetFanSpeed": true,
+            "CanSetVaneDirection": true,
+            "CanSetPower": true,
+            "CanSetTemperatureIncrementOverride": true,
+            "CanDisableLocalController": true,
+            "CanSetDemandSideControl": false
+          },
+          "Device": {
+            "DeviceType": 0,
+            "CanCool": true,
+            "CanHeat": true,
+            "CanDry": true,
+            "CanAuto": true,
+            "HasAutomaticFanSpeed": true,
+            "NumberOfFanSpeeds": 5,
+            "TemperatureIncrement": 0.5,
+            "MinTempCoolDry": 16.0,
+            "MaxTempCoolDry": 31.0,
+            "MinTempHeat": 10.0,
+            "MaxTempHeat": 31.0,
+            "MinTempAutomatic": 16.0,
+            "MaxTempAutomatic": 31.0,
+            "ModelSupportsFanSpeed": true,
+            "ModelSupportsAuto": true,
+            "ModelSupportsHeat": true,
+            "ModelSupportsDry": true,
+            "ModelSupportsVaneVertical": true,
+            "ModelSupportsVaneHorizontal": true,
+            "ModelSupportsWideVane": true,
+            "Power": true,
+            "RoomTemperature": 24.5,
+            "SetTemperature": 22.0,
+            "OperationMode": 3,
+            "FanSpeed": 2,
+            "ActualFanSpeed": 2,
+            "VaneVerticalDirection": 3,
+            "VaneHorizontalDirection": 3,
+            "EffectiveFlags": 0,
+            "HasEnergyConsumedMeter": true,
+            "CurrentEnergyConsumed": 125000,
+            "MqttFlags": 9,
+            "WifiSignalStrength": -60,
+            "WifiAdapterStatus": "NORMAL",
+            "Offline": false,
+            "LastTimeStamp": "2026-01-15T11:05:00",
+            "ErrorCode": 8000,
+            "HasError": false,
+            "DeviceID": 1000001,
+            "MacAddress": "02:00:00:00:00:01",
+            "SerialNumber": "0000000001",
+            "FirmwareAppVersion": 20000,
+            "Units": [
+              {
+                "ID": 1,
+                "Device": 0,
+                "SerialNumber": null,
+                "DeviceType": null,
+                "ModelNumber": 2,
+                "Model": "EXAMPLE-35",
+                "UnitType": 1,
+                "IsIndoor": true
+              }
+            ]
+          }
+        }
+      ],
+      "Clients": []
+    }
+  }
+]
