@@ -8,16 +8,32 @@ and controls a real device on a real account.
 
 ## Status
 
-The command line and the interactive TUI both show and control the unit. Shell completions, a
-man page and release binaries are next.
-The API has been verified live for login, device listing, reading unit state and changing the
-target temperature.
+The command line and the interactive TUI both show and control the unit. The API has been
+verified live for login, device listing, reading the unit's state and every kind of command.
+klima runs on Linux and macOS; Windows is not supported.
+
+## Install
+
+Prebuilt binaries for Linux (x86_64 and aarch64, static) and macOS (Apple silicon and Intel)
+are on the [releases page](https://github.com/lednifrolg/melcloud-ac/releases). Each archive
+holds the binary, shell completions and man pages:
+
+```sh
+target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin
+curl -fsSLO "https://github.com/lednifrolg/melcloud-ac/releases/latest/download/klima-$target.tar.gz"
+tar -xzf "klima-$target.tar.gz"
+install -m 755 "klima-$target/klima" ~/.local/bin/
+```
+
+`SHA256SUMS` on the release page lists the checksums, and
+`gh attestation verify "klima-$target.tar.gz" --repo lednifrolg/melcloud-ac` checks that an
+archive was built from this repository by its release workflow.
+
+From source, with Rust installed: `cargo install --path crates/klima --locked` in a clone.
 
 ## Usage
 
 ```sh
-cargo install --path crates/klima
-
 klima                  # the interactive TUI
 klima login            # asks for email and password; stores only the session
 klima devices          # devices on the account (cached for a day, --fresh to ask again)
