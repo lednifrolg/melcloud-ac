@@ -39,14 +39,16 @@ if command -v sha256sum > /dev/null; then sha256sum -c checksum; else shasum -a 
 rm -f "klima-$target.tar.gz"
 ```
 
-An archive that fails the check is deleted, so the steps below cannot install it. With the
-GitHub CLI logged in, this checks that the archive was built from that tag by this
-repository's release workflow:
+An archive that fails the check is deleted, so the steps below cannot install it. The
+checksums come from the same release, so they catch a broken download, not a tampered
+release. With the GitHub CLI logged in, this checks that the archive was built from that tag
+by this repository's release workflow, and deletes it otherwise:
 
 ```sh
 gh attestation verify "klima-$target.tar.gz" --repo lednifrolg/melcloud-ac \
   --cert-identity "https://github.com/lednifrolg/melcloud-ac/.github/workflows/release.yml@refs/tags/$tag" \
-  --deny-self-hosted-runners
+  --deny-self-hosted-runners ||
+rm -f "klima-$target.tar.gz"
 ```
 
 Then, in the same terminal, this installs it into `~/.local/bin`:
@@ -67,11 +69,12 @@ systems, like a 32-bit Raspberry Pi, build from source (below). The archive also
 completions in `completions/` and man pages in `man/man1/`, the same files `klima completions`
 and `klima man` write (see [Usage](#usage)).
 
-The installed binary is attested as well, so it can be checked later from any terminal:
+The installed binary is attested as well, so it can be checked later from any terminal,
+without running it:
 
 ```sh
 gh attestation verify ~/.local/bin/klima --repo lednifrolg/melcloud-ac \
-  --cert-identity "https://github.com/lednifrolg/melcloud-ac/.github/workflows/release.yml@refs/tags/v$(~/.local/bin/klima --version | cut -d ' ' -f 2)" \
+  --cert-identity-regex '^https://github\.com/lednifrolg/melcloud-ac/\.github/workflows/release\.yml@refs/tags/v' \
   --deny-self-hosted-runners
 ```
 

@@ -104,7 +104,9 @@ jobs:
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ${{ matrix.target }}
-          path: dist/*.tar.gz
+          # Exactly the archive for this target: nothing else a build leaves in dist/ is
+          # published.
+          path: dist/klima-${{ matrix.target }}.tar.gz
           if-no-files-found: error
           # Archives built for a pull request are for checking, not for passing around.
           retention-days: ${{ github.event_name == 'pull_request' && 1 || 30 }}
@@ -137,16 +139,23 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: sha256sum klima-*.tar.gz > SHA256SUMS
-      # The binaries are attested too, so an installed klima can be checked on its own.
-      - name: Unpack the binaries
+      # The binaries are attested too, so an installed klima can be checked on its own. Only the
+      # bytes of each binary are read out: entries of an archive never become files, links or
+      # directories in this job, which can write.
+      - name: Read the binaries out
         working-directory: dist
-        run: for archive in klima-*.tar.gz; do tar -xzf "$archive"; done
+        run: |
+          for archive in klima-*.tar.gz; do
+            name=${archive%.tar.gz}
+            mkdir -p "binaries/$name"
+            tar -xzOf "$archive" "$name/klima" > "binaries/$name/klima"
+          done
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/klima-*.tar.gz
             dist/SHA256SUMS
-            dist/klima-*/klima
+            dist/binaries/klima-*/klima
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
