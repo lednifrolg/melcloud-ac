@@ -5,7 +5,7 @@ use std::error::Error as _;
 use std::io::{self, IsTerminal, Write};
 
 use anstream::{eprint, eprintln, println};
-use anstyle::{AnsiColor, Style};
+use anstyle::{Ansi256Color, AnsiColor, Style};
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use melcloud::{
@@ -16,6 +16,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::error::AppError;
+use crate::theme;
 
 const DIM: Style = Style::new().dimmed();
 const BOLD: Style = Style::new().bold();
@@ -26,14 +27,10 @@ const CYAN: Style = AnsiColor::Cyan.on_default();
 
 /// The color that stands for a mode, as in the TUI.
 fn accent(mode: OperationMode) -> Style {
-    let color = match mode {
-        OperationMode::Heat => AnsiColor::BrightYellow,
-        OperationMode::Dry => AnsiColor::Cyan,
-        OperationMode::Cool => AnsiColor::BrightCyan,
-        OperationMode::Auto => AnsiColor::BrightMagenta,
-        OperationMode::Fan | OperationMode::Other(_) => AnsiColor::White,
-    };
-    color.on_default()
+    let color = Ansi256Color(theme::mode_color(mode));
+    color
+        .into_ansi()
+        .map_or_else(|| color.on_default(), AnsiColor::on_default)
 }
 
 fn paint(style: Style, text: impl std::fmt::Display) -> String {
@@ -81,7 +78,8 @@ pub fn duration(span: SignedDuration) -> String {
     }
 }
 
-pub fn error(error: &AppError) {
+/// The error with the causes that add something, in one line.
+pub fn message(error: &AppError) -> String {
     let mut message = error.to_string();
     let mut cause = error.source();
     while let Some(inner) = cause {
@@ -91,7 +89,11 @@ pub fn error(error: &AppError) {
         }
         cause = inner.source();
     }
-    eprintln!("{} {message}", paint(RED.bold(), "error:"));
+    message
+}
+
+pub fn error(error: &AppError) {
+    eprintln!("{} {}", paint(RED.bold(), "error:"), message(error));
 }
 
 pub fn note(text: impl std::fmt::Display) {
@@ -110,17 +112,10 @@ pub fn json(value: &impl Serialize) {
 }
 
 fn fan_bars(fan: FanSpeed, levels: u8, style: Style) -> String {
-    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
-    let top = usize::from(levels.max(2)) - 1;
     (1..=levels)
         .map(|level| {
-            let block = BLOCKS[(usize::from(level) - 1) * 7 / top];
-            let lit = match fan {
-                FanSpeed::Auto => true,
-                FanSpeed::Level(current) => level <= current,
-                FanSpeed::Other(_) => false,
-            };
-            paint(if lit { style } else { DIM }, block)
+            let lit = theme::fan_bar_lit(level, fan);
+            paint(if lit { style } else { DIM }, theme::fan_bar(level, levels))
         })
         .collect()
 }

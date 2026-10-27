@@ -152,6 +152,21 @@ impl Ledger {
     }
 }
 
+/// Requests in the last hour, for display. Reads without the lock; a writer replaces the file
+/// atomically, so this sees the old or the new ledger.
+pub fn requests_last_hour(paths: &Paths, now: Timestamp) -> usize {
+    read_json::<Ledger>(&paths.ledger())
+        .ok()
+        .flatten()
+        .map_or(0, |ledger| {
+            ledger
+                .requests
+                .iter()
+                .filter(|&&at| at + HOUR > now)
+                .count()
+        })
+}
+
 /// Runs `change` on the ledger while holding the lock that serializes all klima processes.
 pub fn update<T>(paths: &Paths, change: impl FnOnce(&mut Ledger) -> T) -> Result<T, AppError> {
     let lock_path = paths.ledger_lock();

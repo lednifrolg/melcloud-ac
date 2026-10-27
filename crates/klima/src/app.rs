@@ -81,6 +81,15 @@ impl App {
         }
     }
 
+    /// Logs in with the password and stores only the session.
+    pub async fn login(&self, email: &str, password: &str) -> Result<melcloud::Session, AppError> {
+        let session = self
+            .call(Request::Login, self.client.login(email, password, true))
+            .await?;
+        session::save(&self.paths, email, &session, Timestamp::now())?;
+        Ok(session)
+    }
+
     /// The device list: cached for a day unless `fresh`.
     pub async fn devices(&self, fresh: bool) -> Result<Cached<DeviceList>, AppError> {
         let path = self.paths.devices();

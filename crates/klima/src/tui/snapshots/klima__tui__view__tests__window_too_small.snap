@@ -1,0 +1,16 @@
+---
+source: crates/klima/src/tui/view.rs
+expression: "screen(&lived_in(), 40, 12)"
+---
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+" klima needs a window of at least 46×19 "
+"        cells; this one is 40×12.       "
+"                                        "
+"                                        "
+"                                        "
+"                                        "
+"                                        "

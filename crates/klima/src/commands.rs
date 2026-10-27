@@ -33,11 +33,8 @@ pub async fn login(app: &App, email: Option<String>, password_stdin: bool) -> Re
         return Err(AppError::Usage("the password is empty".into()));
     }
 
-    let session = app
-        .call(Request::Login, app.client.login(&email, &password, true))
-        .await?;
+    let session = app.login(&email, &password).await?;
     let now = Timestamp::now();
-    session::save(&app.paths, &email, &session, now)?;
     match session.expires_at() {
         Some(until) => output::success(format!(
             "Logged in as {email}. The session lasts until {} ({}).",

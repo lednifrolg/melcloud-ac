@@ -16,7 +16,9 @@ anstream = "1.0"
 anstyle = "1.0"
 bitflags = "2.13"
 clap = { version = "4.6", features = ["derive"] }
+insta = "1.49"
 jiff = { version = "0.2", features = ["serde"] }
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 # `charset` is left out: responses are read as bytes and parsed as UTF-8 JSON.
 reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2", "system-proxy"] }
 rpassword = "7.5"

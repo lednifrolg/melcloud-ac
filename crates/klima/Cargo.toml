@@ -13,6 +13,7 @@ anstyle.workspace = true
 clap.workspace = true
 jiff.workspace = true
 melcloud.workspace = true
+ratatui.workspace = true
 rpassword.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -21,6 +22,7 @@ tokio = { workspace = true, features = ["time"] }
 toml.workspace = true
 
 [dev-dependencies]
+insta.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["process", "rt-multi-thread"] }
 wiremock.workspace = true

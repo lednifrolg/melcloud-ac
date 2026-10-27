@@ -61,6 +61,24 @@ struct Sample<'a> {
     error_message: Option<&'a str>,
 }
 
+/// Room temperatures of `device` read since `since`, oldest first.
+pub fn room_history(paths: &Paths, device: DeviceId, since: Timestamp) -> Vec<(Timestamp, f64)> {
+    #[derive(Deserialize)]
+    struct Stored {
+        at: Timestamp,
+        device: DeviceId,
+        room: f64,
+    }
+    let Ok(text) = std::fs::read_to_string(paths.history()) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| serde_json::from_str::<Stored>(line).ok())
+        .filter(|sample| sample.device == device && sample.at >= since)
+        .map(|sample| (sample.at, sample.room))
+        .collect()
+}
+
 /// Appends a state read from the server to the history used for charts.
 pub fn record_history(paths: &Paths, view: &AtaView, now: Timestamp) -> Result<(), AppError> {
     let sample = Sample {

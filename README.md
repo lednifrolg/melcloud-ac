@@ -8,7 +8,8 @@ and controls a real device on a real account.
 
 ## Status
 
-The command line works: login, devices, unit state and commands. The interactive TUI is next.
+The command line works: login, devices, unit state and commands. The interactive TUI shows the
+unit; controlling it from the TUI comes next.
 The API has been verified live for login, device listing, reading unit state and changing the
 target temperature.
 
@@ -17,6 +18,7 @@ target temperature.
 ```sh
 cargo install --path crates/klima
 
+klima                  # the interactive TUI
 klima login            # asks for email and password; stores only the session
 klima devices          # devices on the account (cached for a day, --fresh to ask again)
 klima status           # unit state (cached for 5 minutes, --fresh to ask again)
@@ -44,7 +46,18 @@ With several devices, pick one with `--device <name or ID>` or set it in
 ```toml
 email = "user@example.com"   # offered by `klima login`
 device = "Living room"
+refresh_minutes = 10         # automatic refresh in the TUI, at least 5
 ```
+
+### TUI
+
+`klima` without a command opens a dashboard: the unit's settings with big digits and a
+temperature scale, the weather at the building, the adapter's WiFi and last contact, the room
+temperature of the last 24 hours and an activity log. It refreshes on its own every 10 minutes
+within the request budget, shows the countdown and the budget in the status line, and picks up
+changes made by `klima` commands in other terminals at once. Keys: `r` refresh, `?` help, `q`
+quit; in a narrow window the panes become tabs (`Tab`, `1`-`4`). Colors come from the terminal's
+palette, so the TUI follows the terminal theme.
 
 `klima login --email <email> --password-stdin` reads the password from standard input, e.g. from
 a password manager. The password is never stored; only the session token is kept, readable only

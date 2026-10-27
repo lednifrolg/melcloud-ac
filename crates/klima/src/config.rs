@@ -15,6 +15,20 @@ pub struct Config {
     pub email: Option<String>,
     /// Device name or ID used when `--device` is not given.
     pub device: Option<String>,
+    /// Minutes between automatic refreshes in the TUI; at least 5.
+    pub refresh_minutes: Option<u32>,
+}
+
+/// Default and lowest refresh interval of the TUI, in minutes.
+pub const REFRESH_MINUTES: u32 = 10;
+pub const MIN_REFRESH_MINUTES: u32 = 5;
+
+impl Config {
+    pub fn refresh_minutes(&self) -> u32 {
+        self.refresh_minutes
+            .unwrap_or(REFRESH_MINUTES)
+            .max(MIN_REFRESH_MINUTES)
+    }
 }
 
 pub fn load(paths: &Paths) -> Result<Config, AppError> {
