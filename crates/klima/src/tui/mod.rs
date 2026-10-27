@@ -13,25 +13,40 @@ use std::fs;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
-use melcloud::{AtaState, DeviceList};
+use melcloud::{AtaState, ChangeSet, Device, DeviceList};
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyEventKind, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::layout::Position;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::app::App;
 use crate::cache::{self, Cached, DEVICES_TTL};
+use crate::control;
 use crate::error::AppError;
 use crate::governor::{self, Refusal, Request};
 use crate::output;
 use crate::session;
-use model::{Account, Effect, Failure, FailureKind, Model, Msg, Start};
+use model::{Account, Effect, Failure, FailureKind, Model, Msg, Row, Start, Target};
+use view::Hotspot;
 
 /// How often the clock, the countdown and the watched files are updated.
 const TICK: Duration = Duration::from_secs(1);
+/// Redraw interval while something moves on screen.
+const FRAME: Duration = Duration::from_millis(80);
+
+/// What reaches the event loop: messages for the model, and mouse events still to be placed.
+enum Incoming {
+    Msg(Box<Msg>),
+    Mouse(MouseEvent),
+}
 const HISTORY_SPAN: SignedDuration = SignedDuration::from_hours(24);
 
 pub async fn run(app: App) -> Result<(), AppError> {
@@ -44,7 +59,20 @@ pub async fn run(app: App) -> Result<(), AppError> {
     let app = Arc::new(app);
     let (mut model, effects) = Model::start(start(&app)?);
     let mut terminal = ratatui::init();
-    let result = event_loop(&app, &mut terminal, &mut model, effects).await;
+    let result = match execute!(io::stdout(), EnableMouseCapture) {
+        Ok(()) => {
+            // Leave the terminal's mouse alone even after a panic.
+            let restore = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let _ = execute!(io::stdout(), DisableMouseCapture);
+                restore(info);
+            }));
+            let result = event_loop(&app, &mut terminal, &mut model, effects).await;
+            let _ = execute!(io::stdout(), DisableMouseCapture);
+            result
+        }
+        Err(e) => Err(AppError::io("terminal", e)),
+    };
     ratatui::restore();
     result
 }
@@ -99,21 +127,32 @@ async fn event_loop(
         spawn(app, &tx, effect);
     }
     let mut watched = Watched::default();
-    let mut tick = tokio::time::interval(TICK);
+    let mut observed = Instant::now();
+    let mut hotspots: Vec<Hotspot> = Vec::new();
     while !model.quit {
         terminal
-            .draw(|frame| view::render(model, frame))
+            .draw(|frame| hotspots = view::render(model, frame))
             .map_err(|e| AppError::io("terminal", e))?;
+        let wait = if model.animating() { FRAME } else { TICK };
         let first = tokio::select! {
-            Some(msg) = rx.recv() => msg,
-            _ = tick.tick() => Msg::Tick(Timestamp::now()),
+            Some(incoming) = rx.recv() => incoming,
+            () = tokio::time::sleep(wait) => Incoming::Msg(Box::new(Msg::Tick(Timestamp::now()))),
         };
-        let mut messages = vec![first];
-        if matches!(messages[0], Msg::Tick(_)) {
-            messages.extend(watched.observe(app, model));
+        let mut incoming = vec![first];
+        while let Ok(more) = rx.try_recv() {
+            incoming.push(more);
         }
-        while let Ok(msg) = rx.try_recv() {
-            messages.push(msg);
+        let mut messages: Vec<Msg> = incoming
+            .into_iter()
+            .filter_map(|incoming| match incoming {
+                Incoming::Msg(msg) => Some(*msg),
+                Incoming::Mouse(event) => place(event, &hotspots),
+            })
+            .collect();
+        messages.push(Msg::Tick(Timestamp::now()));
+        if observed.elapsed() >= TICK {
+            observed = Instant::now();
+            messages.extend(watched.observe(app, model));
         }
         for msg in messages {
             for effect in model.update(msg) {
@@ -124,18 +163,48 @@ async fn event_loop(
     Ok(())
 }
 
+/// The message a click or the wheel stands for, by what is under the pointer.
+fn place(event: MouseEvent, hotspots: &[Hotspot]) -> Option<Msg> {
+    let pointer = Position::new(event.column, event.row);
+    let target = hotspots
+        .iter()
+        .rev()
+        .find(|spot| spot.area.contains(pointer))?
+        .target;
+    let temperature = target == Target::Row(Row::Temperature);
+    match event.kind {
+        MouseEventKind::Down(MouseButton::Left) => Some(Msg::Target(target)),
+        MouseEventKind::ScrollUp if temperature => Some(Msg::Wheel(1)),
+        MouseEventKind::ScrollDown if temperature => Some(Msg::Wheel(-1)),
+        _ => None,
+    }
+}
+
 /// Reads terminal events on their own thread, since reading blocks.
-fn read_input(tx: UnboundedSender<Msg>) {
+fn read_input(tx: UnboundedSender<Incoming>) {
     std::thread::spawn(move || {
         loop {
-            let msg = match event::read() {
-                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => Msg::Key(key),
+            let incoming = match event::read() {
+                Ok(Event::Key(key)) if key.kind == KeyEventKind::Press => {
+                    Incoming::Msg(Box::new(Msg::Key(key)))
+                }
                 // A tick redraws at the new size.
-                Ok(Event::Resize(..)) => Msg::Tick(Timestamp::now()),
+                Ok(Event::Resize(..)) => Incoming::Msg(Box::new(Msg::Tick(Timestamp::now()))),
+                // Moves and drags would only cost redraws.
+                Ok(Event::Mouse(mouse))
+                    if matches!(
+                        mouse.kind,
+                        MouseEventKind::Down(_)
+                            | MouseEventKind::ScrollUp
+                            | MouseEventKind::ScrollDown
+                    ) =>
+                {
+                    Incoming::Mouse(mouse)
+                }
                 Ok(_) => continue,
                 Err(_) => return,
             };
-            if tx.send(msg).is_err() {
+            if tx.send(incoming).is_err() {
                 return;
             }
         }
@@ -143,20 +212,28 @@ fn read_input(tx: UnboundedSender<Msg>) {
 }
 
 /// Runs background work through [`App`] and reports back with a message.
-fn spawn(app: &Arc<App>, tx: &UnboundedSender<Msg>, effect: Effect) {
+fn spawn(app: &Arc<App>, tx: &UnboundedSender<Incoming>, effect: Effect) {
     let app = Arc::clone(app);
     let tx = tx.clone();
     tokio::spawn(async move {
-        let msg = match effect {
-            Effect::LoadDevices => Msg::Devices(load_devices(&app).await.map_err(|e| failure(&e))),
-            Effect::Refresh { device, manual } => Msg::State {
+        // The receiver is gone only when the TUI has quit.
+        let report = |msg| {
+            let _ = tx.send(Incoming::Msg(Box::new(msg)));
+        };
+        match effect {
+            Effect::LoadDevices => {
+                report(Msg::Devices(
+                    load_devices(&app).await.map_err(|e| failure(&e)),
+                ));
+            }
+            Effect::Refresh { device, manual } => report(Msg::State {
                 result: app
                     .read_state(&device, Request::State(device.id))
                     .await
                     .map_err(|e| failure(&e)),
                 manual,
-            },
-            Effect::Login { email, password } => Msg::LoggedIn(
+            }),
+            Effect::Login { email, password } => report(Msg::LoggedIn(
                 app.login(&email, &password)
                     .await
                     .map(|session| Account {
@@ -164,11 +241,41 @@ fn spawn(app: &Arc<App>, tx: &UnboundedSender<Msg>, effect: Effect) {
                         expires_at: session.expires_at(),
                     })
                     .map_err(|e| failure(&e)),
-            ),
-        };
-        // The receiver is gone only when the TUI has quit.
-        let _ = tx.send(msg);
+            )),
+            Effect::Send { device, changes } => send(&app, &device, changes, report).await,
+        }
     });
+}
+
+/// Sends `changes` as one command and checks the unit applied it, the same way `klima set`
+/// does: built on the freshest state the budget allows, without what the unit already has.
+async fn send(app: &App, device: &Device, changes: ChangeSet, report: impl Fn(Msg)) {
+    let sent: Result<_, AppError> = async {
+        let base = app.base_state(device).await?;
+        let changes = control::changes(changes, base.value.view());
+        if changes.is_empty() {
+            return Err(AppError::Usage(
+                "nothing to send: the unit already has these settings".into(),
+            ));
+        }
+        let command = changes
+            .build(device, &base.value)
+            .map_err(AppError::Invalid)?;
+        let sent_at = Timestamp::now();
+        let answer = app.send(device, &command).await?;
+        Ok((changes, answer, sent_at))
+    }
+    .await;
+    let (changes, answer, sent_at) = match sent {
+        Ok(sent) => sent,
+        Err(error) => return report(Msg::Sent(Err(failure(&error)))),
+    };
+    report(Msg::Sent(Ok(())));
+    let result = control::confirm(app, device, &changes, &answer, sent_at, false)
+        .await
+        .map_err(|e| failure(&e));
+    let state = cache::load(&app.paths.state_of(device.id));
+    report(Msg::Confirmed { result, state });
 }
 
 async fn load_devices(

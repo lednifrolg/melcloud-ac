@@ -5,17 +5,96 @@ use std::collections::VecDeque;
 
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
-use melcloud::{AtaState, AtaView, Device, DeviceList};
+use melcloud::{
+    AtaState, AtaView, Capabilities, ChangeSet, Device, DeviceList, FanSpeed, OperationMode,
+    VaneHorizontal, VaneVertical,
+};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::keymap::{self, Action};
 use crate::cache::{Cached, STATE_TTL};
+use crate::control;
 
 /// Panes as tabs, for narrow windows.
 pub const TABS: [&str; 4] = ["control", "info", "history", "activity"];
 const ACTIVITY_LIMIT: usize = 100;
 /// After a failure that is not about limits, try again this soon.
 const RETRY_AFTER_FAILURE: SignedDuration = SignedDuration::from_mins(2);
+/// Changes made within this long of each other go out as one command.
+pub const MERGE_WINDOW: SignedDuration = SignedDuration::from_secs(3);
+/// How long the result of a command stays in the control pane.
+pub const NOTICE_SHOWN: SignedDuration = SignedDuration::from_secs(5);
+
+/// A setting row of the control pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Row {
+    Temperature,
+    Mode,
+    Fan,
+    VaneVertical,
+    VaneHorizontal,
+}
+
+/// The rows a unit with `caps` has, top to bottom.
+pub fn rows(caps: &Capabilities) -> Vec<Row> {
+    let mut rows = vec![Row::Temperature, Row::Mode];
+    if caps.fan_levels > 0 {
+        rows.push(Row::Fan);
+    }
+    if caps.vane_vertical {
+        rows.push(Row::VaneVertical);
+    }
+    if caps.vane_horizontal {
+        rows.push(Row::VaneHorizontal);
+    }
+    rows
+}
+
+/// What a mouse click points at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Row(Row),
+    Mode(OperationMode),
+    Fan(FanSpeed),
+}
+
+/// A change asked for with a key or the mouse, before it is fitted to the unit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Edit {
+    /// Steps of the unit's temperature increment.
+    Temperature(i32),
+    Mode(OperationMode),
+    NextMode(i32),
+    Fan(FanSpeed),
+    NextFan(i32),
+    NextVertical(i32),
+    NextHorizontal(i32),
+    SwingVertical,
+    SwingHorizontal,
+    Power,
+}
+
+/// Changes waiting for the merge window to close.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Pending {
+    pub changes: ChangeSet,
+    pub deadline: Timestamp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    Sending,
+    /// Sent; waiting for the adapter to pick the command up.
+    Confirming,
+}
+
+/// A command on its way to the unit.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Flight {
+    pub changes: ChangeSet,
+    pub phase: Phase,
+    pub since: Timestamp,
+}
 
 /// What is being fetched in the background.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +169,16 @@ pub enum Msg {
         manual: bool,
     },
     LoggedIn(Result<Account, Failure>),
+    /// Whether the server took the command.
+    Sent(Result<(), Failure>),
+    /// How the check of the command ended, and the state stored meanwhile.
+    Confirmed {
+        result: Result<Option<SignedDuration>, Failure>,
+        state: Option<Cached<AtaState>>,
+    },
+    Target(Target),
+    /// Mouse wheel over the temperature: steps up (positive) or down.
+    Wheel(i32),
     /// Another klima process stored a newer state.
     External(Cached<AtaState>),
     Budget(usize),
@@ -100,8 +189,18 @@ pub enum Msg {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Effect {
     LoadDevices,
-    Refresh { device: Box<Device>, manual: bool },
-    Login { email: String, password: String },
+    Refresh {
+        device: Box<Device>,
+        manual: bool,
+    },
+    Login {
+        email: String,
+        password: String,
+    },
+    Send {
+        device: Box<Device>,
+        changes: ChangeSet,
+    },
 }
 
 /// Everything the TUI starts with, read from disk.
@@ -134,7 +233,15 @@ pub struct Model {
     pub activity: VecDeque<Entry>,
     pub overlay: Overlay,
     pub tab: usize,
+    pub row: Row,
+    pub pending: Option<Pending>,
+    pub flight: Option<Flight>,
+    /// The latest result or hint for the control pane.
+    pub notice: Option<Entry>,
+    /// Quit was asked for while changes wait to be sent.
+    pub quitting: bool,
     pub quit: bool,
+    quit_after_send: bool,
     preferred_device: Option<String>,
     email: Option<String>,
 }
@@ -163,6 +270,88 @@ fn differences(before: &AtaView, after: &AtaView) -> Vec<String> {
         ));
     }
     changes
+}
+
+/// Puts `changes` into `view`, as the unit will have them.
+fn apply(view: &mut AtaView, changes: ChangeSet) {
+    if let Some(power) = changes.power {
+        view.power = power;
+    }
+    if let Some(mode) = changes.mode {
+        view.mode = mode;
+    }
+    if let Some(target) = changes.target_temperature {
+        view.target_temperature = target;
+    }
+    if let Some(fan) = changes.fan_speed {
+        view.fan_speed = fan;
+    }
+    if let Some(vane) = changes.vane_vertical {
+        view.vane_vertical = vane;
+    }
+    if let Some(vane) = changes.vane_horizontal {
+        view.vane_horizontal = vane;
+    }
+}
+
+/// The new values of `changes`, e.g. "power on, 22.5 °C, fan auto".
+pub fn summary(changes: ChangeSet) -> String {
+    let mut parts = Vec::new();
+    if let Some(power) = changes.power {
+        parts.push(format!("power {}", if power { "on" } else { "off" }));
+    }
+    if let Some(mode) = changes.mode {
+        parts.push(format!("mode {mode}"));
+    }
+    if let Some(target) = changes.target_temperature {
+        parts.push(format!("{target:.1} °C"));
+    }
+    if let Some(fan) = changes.fan_speed {
+        parts.push(format!("fan {fan}"));
+    }
+    if let Some(vane) = changes.vane_vertical {
+        parts.push(format!("vane ↕ {vane}"));
+    }
+    if let Some(vane) = changes.vane_horizontal {
+        parts.push(format!("vane ↔ {vane}"));
+    }
+    parts.join(", ")
+}
+
+/// The option `step` places after `current` in `options`, wrapping around; the first one when
+/// `current` is not among them.
+fn cycle<T: Copy + PartialEq>(options: &[T], current: T, step: i32) -> Option<T> {
+    let count = i32::try_from(options.len()).ok().filter(|&n| n > 0)?;
+    let Some(index) = options.iter().position(|&o| o == current) else {
+        return options.first().copied();
+    };
+    let next = (i32::try_from(index).ok()? + step).rem_euclid(count);
+    options.get(usize::try_from(next).ok()?).copied()
+}
+
+fn fan_speeds(caps: &Capabilities) -> Vec<FanSpeed> {
+    let auto = caps.fan_auto.then_some(FanSpeed::Auto);
+    auto.into_iter()
+        .chain((1..=caps.fan_levels).map(FanSpeed::Level))
+        .collect()
+}
+
+fn vertical_positions() -> Vec<VaneVertical> {
+    let positions = (1..=5).map(VaneVertical::Position);
+    std::iter::once(VaneVertical::Auto)
+        .chain(positions)
+        .chain([VaneVertical::Swing])
+        .collect()
+}
+
+fn horizontal_positions(caps: &Capabilities) -> Vec<VaneHorizontal> {
+    let positions = (1..=5).map(VaneHorizontal::Position);
+    let split = caps.wide_vane.then_some(VaneHorizontal::Split);
+    std::iter::once(VaneHorizontal::Auto)
+        .chain(positions)
+        .chain(split)
+        .chain([VaneHorizontal::Swing])
+        .collect()
 }
 
 /// The device to show: the preferred one by name or ID, else the first air conditioner.
@@ -203,7 +392,13 @@ impl Model {
             activity: VecDeque::new(),
             overlay: Overlay::None,
             tab: 0,
+            row: Row::Temperature,
+            pending: None,
+            flight: None,
+            notice: None,
+            quitting: false,
             quit: false,
+            quit_after_send: false,
             preferred_device: start.preferred_device,
             email: start.email,
         };
@@ -220,6 +415,29 @@ impl Model {
 
     pub fn device(&self) -> Option<&Device> {
         Some(&self.devices.as_ref()?.value.devices()[self.device?])
+    }
+
+    /// The unit as the control pane shows it: the last known state with the changes on their
+    /// way applied.
+    pub fn shown(&self) -> Option<AtaView> {
+        let mut view = self.state.as_ref()?.value.view().clone();
+        let on_the_way = [
+            self.flight.map(|f| f.changes),
+            self.pending.map(|p| p.changes),
+        ];
+        for changes in on_the_way.into_iter().flatten() {
+            apply(&mut view, changes);
+        }
+        Some(view)
+    }
+
+    /// Whether something moves on screen, so the TUI redraws often.
+    pub fn animating(&self) -> bool {
+        let recent_notice = self
+            .notice
+            .as_ref()
+            .is_some_and(|n| n.at + NOTICE_SHOWN > self.now);
+        self.pending.is_some() || self.flight.is_some() || recent_notice
     }
 
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
@@ -278,7 +496,8 @@ impl Model {
                     .state
                     .as_ref()
                     .is_none_or(|s| state.fetched_at > s.fetched_at);
-                if newer && self.busy != Some(Busy::State) {
+                // While a command is on its way, the stored states are its own.
+                if newer && self.busy != Some(Busy::State) && self.flight.is_none() {
                     let changes = self
                         .state
                         .as_ref()
@@ -289,10 +508,83 @@ impl Model {
                     }
                 }
             }
+            Msg::Sent(result) => self.sent(result),
+            Msg::Confirmed { result, state } => self.confirmed(result, state),
+            Msg::Target(target) => self.point_at(target),
+            Msg::Wheel(steps) => {
+                self.row = Row::Temperature;
+                self.edit(Edit::Temperature(steps));
+            }
             Msg::Budget(requests) => self.requests_last_hour = requests,
             Msg::History(history) => self.history = history,
         }
         self.due()
+    }
+
+    /// The server took the command, or refused it. The answer already carries the new values;
+    /// the control pane shows them from the flight, and the confirmed state replaces the last
+    /// known one when the check ends.
+    fn sent(&mut self, result: Result<(), Failure>) {
+        match result {
+            Ok(()) => {
+                if let Some(flight) = &mut self.flight {
+                    flight.phase = Phase::Confirming;
+                }
+            }
+            Err(failure) => {
+                self.flight = None;
+                self.notify(Tone::Bad, failure.message.clone());
+                self.failed(failure);
+            }
+        }
+        if self.quit_after_send {
+            self.quit = true;
+        }
+    }
+
+    fn confirmed(
+        &mut self,
+        result: Result<Option<SignedDuration>, Failure>,
+        state: Option<Cached<AtaState>>,
+    ) {
+        let flight = self.flight.take();
+        if let Some(state) = state {
+            self.adopt(state);
+        }
+        match result {
+            Ok(delay) => {
+                let text = delay.map_or_else(
+                    || "applied".to_owned(),
+                    |d| {
+                        format!(
+                            "applied · the adapter took it {:.1} s after sending",
+                            d.as_secs_f64()
+                        )
+                    },
+                );
+                self.notify(Tone::Good, text);
+                let what = flight.map(|f| summary(f.changes)).unwrap_or_default();
+                self.log(Tone::Good, format!("applied: {what}"));
+            }
+            Err(failure) => {
+                self.notify(Tone::Bad, failure.message.clone());
+                self.log(Tone::Bad, failure.message);
+            }
+        }
+    }
+
+    fn point_at(&mut self, target: Target) {
+        match target {
+            Target::Row(row) => self.row = row,
+            Target::Mode(mode) => {
+                self.row = Row::Mode;
+                self.edit(Edit::Mode(mode));
+            }
+            Target::Fan(fan) => {
+                self.row = Row::Fan;
+                self.edit(Edit::Fan(fan));
+            }
+        }
     }
 
     /// Shows `state` and schedules the next automatic refresh after it.
@@ -304,6 +596,14 @@ impl Model {
     /// Starts the background work that is due: the device list first, then a state read once
     /// the cached state is too old.
     fn due(&mut self) -> Vec<Effect> {
+        // While quitting is asked about, the changes wait for the answer.
+        let closed = self.pending.is_some_and(|p| p.deadline <= self.now) && !self.quitting;
+        if closed && self.flight.is_none() {
+            return self.flush();
+        }
+        if self.pending.is_some() || self.flight.is_some() {
+            return Vec::new();
+        }
         let logging_in = matches!(self.overlay, Overlay::Login(_));
         if self.busy.is_some() || self.account.is_none() || logging_in {
             return Vec::new();
@@ -395,17 +695,231 @@ impl Model {
             }
             return Vec::new();
         }
+        if self.quitting {
+            return self.quitting_key(key);
+        }
+        let on_the_way = self.pending.is_some() || self.flight.is_some();
         match keymap::action(key) {
+            Some(Action::Up) => self.select(-1),
+            Some(Action::Down) => self.select(1),
+            Some(Action::Decrease) => self.change_row(-1),
+            Some(Action::Increase) => self.change_row(1),
+            Some(Action::Warmer) => self.edit(Edit::Temperature(1)),
+            Some(Action::Cooler) => self.edit(Edit::Temperature(-1)),
+            Some(Action::NextMode) => self.edit(Edit::NextMode(1)),
+            Some(Action::NextFan) => self.edit(Edit::NextFan(1)),
+            Some(Action::SwingVertical) => self.edit(Edit::SwingVertical),
+            Some(Action::SwingHorizontal) => self.edit(Edit::SwingHorizontal),
+            Some(Action::Power) => self.edit(Edit::Power),
+            Some(Action::Send) => return self.flush(),
+            Some(Action::Discard) => self.discard(),
             Some(Action::Refresh) if self.account.is_none() => self.open_login(),
+            Some(Action::Refresh) if on_the_way => {}
             Some(Action::Refresh) => return self.refresh(true),
-            Some(Action::Login) => self.open_login(),
             Some(Action::NextTab) => self.tab = (self.tab + 1) % TABS.len(),
             Some(Action::Tab(index)) if index < TABS.len() => self.tab = index,
             Some(Action::Help) => self.overlay = Overlay::Help,
+            Some(Action::Quit) if self.pending.is_some() => self.quitting = true,
+            Some(Action::Quit) if self.flight.is_some_and(|f| f.phase == Phase::Sending) => {
+                self.quit_after_send = true;
+            }
             Some(Action::Quit) => self.quit = true,
             Some(Action::Tab(_)) | None => {}
         }
         Vec::new()
+    }
+
+    /// Keys while asking what to do with waiting changes before quitting.
+    fn quitting_key(&mut self, key: KeyEvent) -> Vec<Effect> {
+        match key.code {
+            KeyCode::Enter => {
+                self.quitting = false;
+                self.quit_after_send = true;
+                return self.flush();
+            }
+            KeyCode::Char('u') => {
+                self.pending = None;
+                self.quit = true;
+            }
+            KeyCode::Esc => self.quitting = false,
+            _ => {}
+        }
+        Vec::new()
+    }
+
+    fn select(&mut self, step: i32) {
+        let Some(caps) = self.device().and_then(|d| d.capabilities.as_ref()) else {
+            return;
+        };
+        let rows = rows(caps);
+        let current = rows.iter().position(|&r| r == self.row).unwrap_or(0);
+        let next = if step < 0 {
+            current.saturating_sub(1)
+        } else {
+            (current + 1).min(rows.len() - 1)
+        };
+        self.row = rows[next];
+    }
+
+    fn change_row(&mut self, step: i32) {
+        self.edit(match self.row {
+            Row::Temperature => Edit::Temperature(step),
+            Row::Mode => Edit::NextMode(step),
+            Row::Fan => Edit::NextFan(step),
+            Row::VaneVertical => Edit::NextVertical(step),
+            Row::VaneHorizontal => Edit::NextHorizontal(step),
+        });
+    }
+
+    /// Fits `edit` to what the unit supports and the account may change, and adds it to the
+    /// changes waiting to be sent.
+    fn edit(&mut self, edit: Edit) {
+        let (Some(device), Some(shown)) = (self.device().cloned(), self.shown()) else {
+            return;
+        };
+        let Some(caps) = device.capabilities.as_ref() else {
+            return;
+        };
+        if self.account.is_none() {
+            self.open_login();
+            return;
+        }
+        let allowed = device.permissions;
+        let refused = |what: &str| format!("this account may not change the {what}");
+        let mut change = ChangeSet::default();
+        match edit {
+            Edit::Temperature(steps) => {
+                let range = caps.temperature_range(shown.mode);
+                let wanted = shown.target_temperature + f64::from(steps) * caps.temperature_step;
+                let target = wanted.clamp(range.min, range.max);
+                if (target - shown.target_temperature).abs() < 1e-6 {
+                    let limit = format!("{}-{} °C in {} mode", range.min, range.max, shown.mode);
+                    return self.notify(Tone::Info, limit);
+                }
+                change.target_temperature = Some(target);
+            }
+            Edit::Mode(_) | Edit::NextMode(_) if !allowed.can_set_operation_mode => {
+                return self.notify(Tone::Warn, refused("mode"));
+            }
+            Edit::Mode(_) | Edit::NextMode(_) => {
+                let mode = match edit {
+                    Edit::NextMode(step) => cycle(&caps.modes, shown.mode, step),
+                    Edit::Mode(mode) => Some(mode),
+                    _ => None,
+                };
+                let Some(mode) = mode.filter(|m| caps.supports_mode(*m)) else {
+                    return;
+                };
+                change.mode = Some(mode);
+                let range = caps.temperature_range(mode);
+                if !range.contains(shown.target_temperature) {
+                    change.target_temperature =
+                        Some(shown.target_temperature.clamp(range.min, range.max));
+                }
+            }
+            Edit::Fan(_) | Edit::NextFan(_) if !allowed.can_set_fan_speed => {
+                return self.notify(Tone::Warn, refused("fan speed"));
+            }
+            Edit::Fan(_) | Edit::NextFan(_) => {
+                let speeds = fan_speeds(caps);
+                change.fan_speed = match edit {
+                    Edit::NextFan(step) => cycle(&speeds, shown.fan_speed, step),
+                    Edit::Fan(fan) => speeds.contains(&fan).then_some(fan),
+                    _ => None,
+                };
+            }
+            Edit::NextVertical(_)
+            | Edit::NextHorizontal(_)
+            | Edit::SwingVertical
+            | Edit::SwingHorizontal
+                if !allowed.can_set_vane_direction =>
+            {
+                return self.notify(Tone::Warn, refused("vanes"));
+            }
+            Edit::NextVertical(step) => {
+                change.vane_vertical = cycle(&vertical_positions(), shown.vane_vertical, step);
+            }
+            Edit::NextHorizontal(step) => {
+                change.vane_horizontal =
+                    cycle(&horizontal_positions(caps), shown.vane_horizontal, step);
+            }
+            Edit::SwingVertical if caps.vane_vertical => {
+                change.vane_vertical = Some(if shown.vane_vertical == VaneVertical::Swing {
+                    VaneVertical::Auto
+                } else {
+                    VaneVertical::Swing
+                });
+            }
+            Edit::SwingHorizontal if caps.vane_horizontal => {
+                change.vane_horizontal = Some(if shown.vane_horizontal == VaneHorizontal::Swing {
+                    VaneHorizontal::Auto
+                } else {
+                    VaneHorizontal::Swing
+                });
+            }
+            Edit::SwingVertical | Edit::SwingHorizontal => return,
+            Edit::Power if !allowed.can_set_power => {
+                return self.notify(Tone::Warn, refused("power"));
+            }
+            Edit::Power => change.power = Some(!shown.power),
+        }
+        self.queue(change);
+    }
+
+    /// Adds `change` to the waiting changes, leaves out what the unit already has, and restarts
+    /// the merge window.
+    fn queue(&mut self, change: ChangeSet) {
+        let Some(mut base) = self.state.as_ref().map(|s| s.value.view().clone()) else {
+            return;
+        };
+        if let Some(flight) = self.flight {
+            apply(&mut base, flight.changes);
+        }
+        let mut changes = self.pending.map(|p| p.changes).unwrap_or_default();
+        changes.merge(change);
+        let changes = control::changes(changes, &base);
+        self.notice = None;
+        self.pending = (!changes.is_empty()).then_some(Pending {
+            changes,
+            deadline: self.now + MERGE_WINDOW,
+        });
+    }
+
+    /// Sends the waiting changes now, unless a command is still on its way.
+    fn flush(&mut self) -> Vec<Effect> {
+        if self.flight.is_some() {
+            return Vec::new();
+        }
+        let (Some(pending), Some(device)) = (self.pending, self.device().cloned()) else {
+            return Vec::new();
+        };
+        self.pending = None;
+        self.flight = Some(Flight {
+            changes: pending.changes,
+            phase: Phase::Sending,
+            since: self.now,
+        });
+        vec![Effect::Send {
+            device: Box::new(device),
+            changes: pending.changes,
+        }]
+    }
+
+    fn discard(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.log(
+                Tone::Info,
+                format!("discarded: {}", summary(pending.changes)),
+            );
+        }
+    }
+
+    fn notify(&mut self, tone: Tone, text: impl Into<String>) {
+        self.notice = Some(Entry {
+            at: self.now,
+            tone,
+            text: text.into(),
+        });
     }
 
     fn login_key(&mut self, key: KeyEvent, mut form: LoginForm) -> Vec<Effect> {
@@ -705,6 +1219,217 @@ pub(crate) mod tests {
         assert!(!model.quit);
         model.update(key(KeyCode::Char('q')));
         assert!(model.quit);
+    }
+
+    fn press(model: &mut Model, code: KeyCode) -> Vec<Effect> {
+        model.update(key(code))
+    }
+
+    fn after(model: &mut Model, delay: SignedDuration) -> Vec<Effect> {
+        model.update(Msg::Tick(model.now + delay))
+    }
+
+    #[test]
+    fn changes_merge_for_three_seconds_and_go_out_as_one_command() {
+        let (mut model, _) = Model::start(start());
+        assert_eq!(press(&mut model, KeyCode::Char('+')), []);
+        assert_eq!(after(&mut model, SignedDuration::from_secs(2)), []);
+        press(&mut model, KeyCode::Char('f'));
+        assert_eq!(model.shown().unwrap().target_temperature, 22.5);
+        assert_eq!(
+            after(&mut model, SignedDuration::from_millis(2900)),
+            [],
+            "window restarted"
+        );
+
+        let sent = after(&mut model, SignedDuration::from_millis(200));
+        let expected = ChangeSet {
+            target_temperature: Some(22.5),
+            fan_speed: Some(FanSpeed::Level(3)),
+            ..ChangeSet::default()
+        };
+        assert!(
+            matches!(sent.as_slice(), [Effect::Send { changes, .. }] if *changes == expected),
+            "{sent:?}"
+        );
+        assert_eq!(model.pending, None);
+        assert_eq!(model.flight.map(|f| f.phase), Some(Phase::Sending));
+    }
+
+    #[test]
+    fn changing_back_leaves_nothing_to_send() {
+        let (mut model, _) = Model::start(start());
+        press(&mut model, KeyCode::Char('+'));
+        press(&mut model, KeyCode::Char('-'));
+        assert_eq!(model.pending, None);
+        assert_eq!(press(&mut model, KeyCode::Enter), []);
+    }
+
+    #[test]
+    fn rows_move_and_change_their_setting() {
+        let (mut model, _) = Model::start(start());
+        press(&mut model, KeyCode::Char('j'));
+        assert_eq!(model.row, Row::Mode);
+        press(&mut model, KeyCode::Right);
+        assert_eq!(model.shown().unwrap().mode, OperationMode::Fan);
+        press(&mut model, KeyCode::Down);
+        press(&mut model, KeyCode::Down);
+        press(&mut model, KeyCode::Down);
+        press(&mut model, KeyCode::Down);
+        assert_eq!(model.row, Row::VaneHorizontal);
+        press(&mut model, KeyCode::Char('l'));
+        press(&mut model, KeyCode::Char('l'));
+        press(&mut model, KeyCode::Char('l'));
+        assert_eq!(
+            model.shown().unwrap().vane_horizontal,
+            VaneHorizontal::Split
+        );
+    }
+
+    #[test]
+    fn temperature_stops_at_the_range_with_a_note() {
+        let (mut model, _) = Model::start(start());
+        model.update(Msg::Wheel(40));
+        assert_eq!(model.shown().unwrap().target_temperature, 31.0);
+        press(&mut model, KeyCode::Char('+'));
+        assert_eq!(model.notice.as_ref().unwrap().text, "16-31 °C in cool mode");
+    }
+
+    #[test]
+    fn switching_to_a_mode_with_another_range_moves_the_temperature_into_it() {
+        let (mut model, _) = Model::start(start());
+        model.update(Msg::Wheel(-12));
+        assert_eq!(model.shown().unwrap().target_temperature, 16.0);
+        model.update(Msg::Target(Target::Mode(OperationMode::Heat)));
+        model.update(Msg::Wheel(-12));
+        assert_eq!(model.shown().unwrap().target_temperature, 10.0);
+        model.update(Msg::Target(Target::Mode(OperationMode::Cool)));
+        assert_eq!(model.shown().unwrap().target_temperature, 16.0);
+    }
+
+    #[test]
+    fn a_command_moves_from_sending_to_applied() {
+        let (mut model, _) = Model::start(start());
+        press(&mut model, KeyCode::Char('P'));
+        assert!(matches!(
+            press(&mut model, KeyCode::Enter).as_slice(),
+            [Effect::Send { .. }]
+        ));
+        assert!(
+            !model.shown().unwrap().power,
+            "shown as sent while on its way"
+        );
+
+        model.update(Msg::Sent(Ok(())));
+        assert_eq!(model.flight.map(|f| f.phase), Some(Phase::Confirming));
+        model.update(Msg::Confirmed {
+            result: Ok(Some(SignedDuration::from_millis(1100))),
+            state: None,
+        });
+        assert_eq!(model.flight, None);
+        let notice = model.notice.as_ref().unwrap();
+        assert_eq!(
+            notice.text,
+            "applied · the adapter took it 1.1 s after sending"
+        );
+        assert_eq!(model.activity[0].text, "applied: power off");
+    }
+
+    #[test]
+    fn changes_made_while_a_command_is_on_its_way_follow_it() {
+        let (mut model, _) = Model::start(start());
+        press(&mut model, KeyCode::Char('+'));
+        press(&mut model, KeyCode::Enter);
+        press(&mut model, KeyCode::Char('+'));
+        assert_eq!(
+            model.pending.unwrap().changes.target_temperature,
+            Some(23.0)
+        );
+        assert_eq!(
+            after(&mut model, SignedDuration::from_secs(4)),
+            [],
+            "waits for the first"
+        );
+        let next = model.update(Msg::Confirmed {
+            result: Ok(None),
+            state: None,
+        });
+        assert!(matches!(next.as_slice(), [Effect::Send { .. }]), "{next:?}");
+    }
+
+    #[test]
+    fn quitting_with_waiting_changes_asks_first() {
+        let (mut model, _) = Model::start(start());
+        press(&mut model, KeyCode::Char('m'));
+        press(&mut model, KeyCode::Char('q'));
+        assert!(model.quitting && !model.quit);
+        press(&mut model, KeyCode::Esc);
+        assert!(!model.quitting && !model.quit);
+
+        press(&mut model, KeyCode::Char('q'));
+        assert!(matches!(
+            press(&mut model, KeyCode::Enter).as_slice(),
+            [Effect::Send { .. }]
+        ));
+        assert!(!model.quit, "waits for the server to take it");
+        model.update(Msg::Sent(Ok(())));
+        assert!(model.quit);
+    }
+
+    #[test]
+    fn waiting_changes_are_not_sent_while_quitting_is_asked_about() {
+        let (mut model, _) = Model::start(start());
+        press(&mut model, KeyCode::Char('m'));
+        press(&mut model, KeyCode::Char('q'));
+        assert_eq!(after(&mut model, SignedDuration::from_secs(10)), []);
+        assert!(model.pending.is_some() && model.quitting);
+        press(&mut model, KeyCode::Esc);
+        assert!(matches!(
+            after(&mut model, SignedDuration::ZERO).as_slice(),
+            [Effect::Send { .. }]
+        ));
+    }
+
+    #[test]
+    fn discarding_drops_the_waiting_changes() {
+        let (mut model, _) = Model::start(start());
+        press(&mut model, KeyCode::Char('m'));
+        press(&mut model, KeyCode::Char('u'));
+        assert_eq!(model.pending, None);
+        assert_eq!(model.activity[0].text, "discarded: mode fan");
+    }
+
+    #[test]
+    fn a_guest_without_the_permission_gets_a_note() {
+        let (mut model, _) = Model::start(Start {
+            preferred_device: Some("Bedroom".into()),
+            ..start()
+        });
+        press(&mut model, KeyCode::Char('f'));
+        assert_eq!(model.pending, None);
+        assert_eq!(
+            model.notice.as_ref().unwrap().text,
+            "this account may not change the fan speed"
+        );
+    }
+
+    #[test]
+    fn no_automatic_refresh_while_changes_wait() {
+        let (mut model, _) = Model::start(start());
+        press(&mut model, KeyCode::Char('m'));
+        model.pending = Some(Pending {
+            deadline: now() + SignedDuration::from_hours(1),
+            ..model.pending.unwrap()
+        });
+        assert_eq!(after(&mut model, SignedDuration::from_mins(30)), []);
+    }
+
+    #[test]
+    fn cycling_wraps_and_starts_over_when_lost() {
+        assert_eq!(cycle(&[1, 2, 3], 3, 1), Some(1));
+        assert_eq!(cycle(&[1, 2, 3], 1, -1), Some(3));
+        assert_eq!(cycle(&[1, 2, 3], 9, 1), Some(1));
+        assert_eq!(cycle::<i32>(&[], 1, 1), None);
     }
 
     #[test]
