@@ -148,7 +148,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "⏎",
         short: "⏎",
-        help: "send the changes now, without waiting 3 s",
+        help: "send now, without the 3 s wait",
         label: "send now",
         hint: Hint::Pending,
         rank: 0,
@@ -168,7 +168,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "r",
         short: "r",
-        help: "refresh now if the budget allows, or log in",
+        help: "refresh now, or log in",
         label: "refresh",
         hint: Hint::Always,
         rank: 3,
@@ -208,7 +208,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "q  Esc",
         short: "q",
-        help: "quit; asks first when changes wait to be sent",
+        help: "quit; asks first if changes wait",
         label: "quit",
         hint: Hint::Always,
         rank: 1,

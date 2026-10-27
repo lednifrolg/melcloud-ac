@@ -1,0 +1,58 @@
+# The README's demo, recorded with vhs (https://github.com/charmbracelet/vhs) against the demo
+# server in crates/klima/examples, so no request reaches MELCloud. The README's development
+# section has the commands that make it and the screenshots.
+
+Output "assets/demo.gif"
+
+Set Shell "bash"
+Set FontFamily "JetBrainsMono Nerd Font"
+Set FontSize 14
+Set Width 1040
+Set Height 640
+Set Padding 16
+Set Theme "Catppuccin Mocha"
+Set TypingSpeed 60ms
+Set Framerate 30
+
+Hide
+Type "export KLIMA_HOME=$(mktemp -d) KLIMA_API_URL=http://127.0.0.1:18891 PATH=$PWD/target/debug:$PATH"
+Enter
+Type "target/debug/examples/demo_server 18891 $KLIMA_HOME > /dev/null & sleep 1"
+Enter
+Type "echo demo | klima login --email user@example.com --password-stdin > /dev/null"
+Enter
+Type "PS1='\[\e[1;34m\]❯\[\e[0m\] '; clear"
+Enter
+Type "klima status"
+Enter
+Type "klima"
+Enter
+Sleep 2s
+Show
+
+Sleep 3s
+Type "+"
+Sleep 400ms
+Type "+"
+Sleep 1.2s
+Enter
+Sleep 3.5s
+Type "f"
+Sleep 1.2s
+Enter
+Sleep 4s
+Type "?"
+Sleep 4s
+Type "?"
+Sleep 500ms
+Type "q"
+Sleep 500ms
+
+Type "klima history"
+Sleep 300ms
+Enter
+Sleep 7s
+
+Hide
+Type "kill %1"
+Enter

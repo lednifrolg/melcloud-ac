@@ -520,7 +520,7 @@ mod tests {
             view.last_communication,
             Some("2026-01-15T10:05:00Z".parse().unwrap())
         );
-        assert_eq!(view.weather.len(), 3);
+        assert_eq!(view.weather.len(), 5);
         assert_eq!(view.weather[0].kind, WeatherKind::Current);
         assert_eq!(view.weather[2].kind, WeatherKind::Night);
     }
@@ -542,7 +542,7 @@ mod tests {
         let mut raw: Map<String, Value> = serde_json::from_str(DEVICE_GET).unwrap();
         raw["WeatherObservations"][0]["Temperature"] = Value::from("warm");
         let state: AtaState = serde_json::from_value(Value::Object(raw)).unwrap();
-        assert_eq!(state.view().weather.len(), 2);
+        assert_eq!(state.view().weather.len(), 4);
     }
 
     #[test]

@@ -48,7 +48,8 @@ const FLASHED: Style = Style::new()
     .fg(Color::Indexed(15))
     .add_modifier(Modifier::BOLD);
 /// A turning fan.
-const FAN: [char; 6] = ['◜', '◠', '◝', '◞', '◡', '◟'];
+/// A two-blade rotor, turning.
+const FAN: [char; 2] = ['▚', '▞'];
 /// Time a swinging vane takes from one position to the next.
 const SWING_STEP: i64 = 250;
 
@@ -111,12 +112,23 @@ pub fn render(model: &Model, frame: &mut Frame) -> Vec<Hotspot> {
     Vec::new()
 }
 
+/// Height of the control pane with every setting and the command status, and the least the
+/// panes under it get; the history and the activity take what a taller window adds.
+const CONTROL_HEIGHT: u16 = 18;
+const BOTTOM_MIN: u16 = 9;
+/// Height of the unit pane.
+const UNIT_HEIGHT: u16 = 7;
+
+/// Control, with the weather and the unit beside it, on a top row as high as the controls
+/// need; history and activity below, growing with the window.
 fn wide(model: &Model, frame: &mut Frame, body: Rect, spots: &mut Vec<Hotspot>) {
-    let [top, bottom] = Layout::vertical([Constraint::Fill(1), Constraint::Length(9)]).areas(body);
+    let top = body.height.saturating_sub(BOTTOM_MIN).min(CONTROL_HEIGHT);
+    let [top, bottom] =
+        Layout::vertical([Constraint::Length(top), Constraint::Fill(1)]).areas(body);
     let columns = || Layout::horizontal([Constraint::Fill(7), Constraint::Fill(4)]).spacing(1);
     let [control_area, side] = columns().areas(top);
     let [outside_area, unit_area] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(7)]).areas(side);
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(UNIT_HEIGHT)]).areas(side);
     let [history_area, activity_area] = columns().areas(bottom);
     control(model, frame, control_area, spots);
     outside(model, frame, outside_area);
@@ -140,7 +152,8 @@ fn tabs(model: &Model, frame: &mut Frame, body: Rect, spots: &mut Vec<Hotspot>) 
         0 => control(model, frame, pane, spots),
         1 => {
             let [outside_area, unit_area] =
-                Layout::vertical([Constraint::Fill(1), Constraint::Length(7)]).areas(pane);
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(UNIT_HEIGHT)])
+                    .areas(pane);
             outside(model, frame, outside_area);
             unit(model, frame, unit_area);
         }
@@ -161,8 +174,10 @@ fn title(text: &str) -> Line<'_> {
     Line::from(vec![" ".into(), Span::styled(text, BOLD), " ".into()])
 }
 
+/// A secondary title on a border. Its own color, so the border's muted color does not dim it
+/// out of sight.
 fn dim_title(text: &str) -> Line<'static> {
-    Line::from(Span::styled(format!(" {text} "), DIM)).right_aligned()
+    Line::from(Span::styled(format!(" {text} "), DIM.fg(Color::Reset))).right_aligned()
 }
 
 fn mode_color(view: &AtaView) -> Option<Color> {
@@ -628,21 +643,48 @@ fn condition(name: &str) -> String {
 
 fn outside(model: &Model, frame: &mut Frame, area: Rect) {
     let block = pane(title("Outside"), MUTED).title_top(dim_title("MELCloud weather"));
+    let width = usize::from(area.width.saturating_sub(4));
+    frame.render_widget(
+        Paragraph::new(outside_lines(model, width)).block(block),
+        area,
+    );
+}
+
+/// The weather at the building, `width` columns wide: the forecast, then sunrise and sunset.
+/// The humidity goes where the conditions leave no room for it, and conditions too long even
+/// without it are shortened.
+fn outside_lines(model: &Model, width: usize) -> Vec<Line<'static>> {
     let weather = model
         .state
         .as_ref()
         .map(|s| s.value.view().weather.as_slice())
         .unwrap_or_default();
     let today = model.now.to_zoned(model.tz.clone()).date();
+    // The label, the temperature and the gap before the conditions.
+    let lead = 11 + 4 + 2;
+    let conditions = weather
+        .iter()
+        .map(|w| condition(&w.condition).chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(width.saturating_sub(lead).max(1));
+    let humidity = lead + conditions + 5 <= width;
     let mut lines: Vec<Line> = weather
         .iter()
         .map(|w| {
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!("{:<11}", weather_label(w.kind, w.time, today)), DIM),
                 Span::styled(format!("{:>3.0}°", w.temperature), BOLD),
-                format!("  {:<11}", condition(&w.condition)).into(),
-                Span::styled(format!("{:>3.0}%", w.humidity), DIM),
-            ])
+                format!(
+                    "  {:<conditions$}",
+                    shorten(&condition(&w.condition), conditions)
+                )
+                .into(),
+            ];
+            if humidity {
+                spans.push(Span::styled(format!(" {:>3.0}%", w.humidity), DIM));
+            }
+            Line::from(spans)
         })
         .collect();
     if let Some(sun) = weather
@@ -665,7 +707,7 @@ fn outside(model: &Model, frame: &mut Frame, area: Rect) {
     if lines.is_empty() {
         lines.push(Line::styled("no weather data", DIM));
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    lines
 }
 
 fn wifi_bars(dbm: i32) -> Vec<Span<'static>> {
@@ -706,7 +748,8 @@ fn unit(model: &Model, frame: &mut Frame, area: Rect) {
         lines.push(Line::from(vec![
             label("energy"),
             format!("{}.{} kWh", meter / 1000, meter % 1000 / 100).into(),
-            Span::styled(" total ?", DIM),
+            // MELCloud does not say what its meter counts; the reading is not verified yet.
+            Span::styled(" · unverified", DIM),
         ]));
     }
     if let Some(last) = view.and_then(|v| v.last_communication) {
@@ -747,6 +790,18 @@ fn unit(model: &Model, frame: &mut Frame, area: Rect) {
             Span::styled("none", Style::new().fg(GOOD))
         };
         lines.push(Line::from(vec![label("errors"), errors]));
+    }
+    // Remarks after " · " give way where the pane is too narrow for them.
+    let width = usize::from(area.width.saturating_sub(4));
+    for line in &mut lines {
+        while line.width() > width
+            && line
+                .spans
+                .last()
+                .is_some_and(|span| span.content.starts_with(" · "))
+        {
+            line.spans.pop();
+        }
     }
     frame.render_widget(
         Paragraph::new(lines).block(pane(title("Unit"), MUTED)),
@@ -1036,7 +1091,7 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
         n if n >= HOURLY_LIMIT * 4 / 5 => WARN,
         _ => Color::Reset,
     });
-    let api = format!("api {}/{HOURLY_LIMIT}·h", model.requests_last_hour);
+    let api = format!("api {}/{HOURLY_LIMIT} per h", model.requests_last_hour);
     segments.push((3, vec![Span::styled(api, budget)]));
     let session = match &model.account {
         Some(account) => match account.expires_at {
@@ -1096,10 +1151,10 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
 
 fn refresh_countdown(model: &Model) -> Vec<Span<'static>> {
     if model.busy == Some(Busy::State) {
-        return vec![Span::raw("↻ refreshing")];
+        return vec![Span::raw("refreshing")];
     }
     let Some(at) = model.next_refresh else {
-        return vec![Span::styled("↻ -", DIM)];
+        return vec![Span::styled("next -", DIM)];
     };
     let left = at.duration_since(model.now).as_secs().max(0);
     let every = model.refresh_every.as_secs().max(1);
@@ -1107,7 +1162,7 @@ fn refresh_countdown(model: &Model) -> Vec<Span<'static>> {
         .unwrap_or(0)
         .min(5);
     vec![
-        Span::raw(format!("↻ {}:{:02} ", left / 60, left % 60)),
+        Span::raw(format!("next {}:{:02} ", left / 60, left % 60)),
         Span::raw("━".repeat(filled)),
         Span::styled("─".repeat(5 - filled), DIM),
     ]
@@ -1188,8 +1243,10 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn help(frame: &mut Frame, area: Rect) {
+    // A second key for an action shares the line above it, so it gets none of its own.
     let mut lines: Vec<Line> = BINDINGS
         .iter()
+        .filter(|b| !b.help.is_empty())
         .map(|b| {
             Line::from(vec![
                 Span::styled(format!("{:<8}", b.keys), BOLD),
@@ -1199,8 +1256,11 @@ fn help(frame: &mut Frame, area: Rect) {
         .collect();
     lines.push(Line::default());
     lines.push(Line::styled("? or Esc closes this help", DIM));
+    // As wide as its widest line, with the borders and the padding.
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) + 4;
+    let width = u16::try_from(width).unwrap_or(u16::MAX);
     let height = u16::try_from(lines.len()).unwrap_or(u16::MAX) + 2;
-    let popup = centered(area, 60.min(area.width), height.min(area.height));
+    let popup = centered(area, width.min(area.width), height.min(area.height));
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines).block(pane(title("Keys"), OVERLAY)),
@@ -1352,6 +1412,41 @@ mod tests {
     }
 
     #[test]
+    fn help_fits_the_narrowest_window() {
+        // The popup's borders and padding, and the keys before each text.
+        let room = usize::from(TABS_MIN.0) - 4 - 8;
+        for binding in BINDINGS {
+            assert!(
+                binding.help.chars().count() <= room,
+                "help for {} is wider than {room}: {}",
+                binding.keys,
+                binding.help
+            );
+        }
+    }
+
+    #[test]
+    fn long_weather_conditions_are_shortened() {
+        let mut model = lived_in();
+        let cached = model.state.as_mut().unwrap();
+        let mut raw = cached.value.raw().clone();
+        for observation in raw["WeatherObservations"].as_array_mut().unwrap() {
+            observation["ConditionName"] = "Moderate or heavy rain shower".into();
+        }
+        cached.value = serde_json::from_value(serde_json::Value::Object(raw)).unwrap();
+        for width in 29..=60 {
+            for line in outside_lines(&model, width) {
+                assert!(line.width() <= width, "{line} is wider than {width}");
+            }
+        }
+        // The outside pane of the narrowest wide layout.
+        assert_eq!(
+            outside_lines(&model, 32)[0].to_string(),
+            "now          2°  moderate or he…"
+        );
+    }
+
+    #[test]
     fn waiting_changes_and_their_countdown() {
         let mut model = lived_in();
         model.update(Msg::Key(KeyCode::Char('+').into()));
@@ -1454,9 +1549,9 @@ mod tests {
                 })
                 .collect::<String>()
         };
-        assert_eq!(glyphs(FanSpeed::Level(5), 125), "◜◠◝◞◡◟◜◠");
-        assert_eq!(glyphs(FanSpeed::Level(1), 625), "◜◠◝◞◡◟◜◠");
-        assert_eq!(glyphs(FanSpeed::Level(1), 125), "◜◜◜◜◜◠◠◠");
+        assert_eq!(glyphs(FanSpeed::Level(5), 125), "▚▞▚▞▚▞▚▞");
+        assert_eq!(glyphs(FanSpeed::Level(1), 625), "▚▞▚▞▚▞▚▞");
+        assert_eq!(glyphs(FanSpeed::Level(1), 125), "▚▚▚▚▚▞▞▞");
         assert_eq!(glyphs(FanSpeed::Auto, 375), glyphs(FanSpeed::Level(3), 375));
     }
 
