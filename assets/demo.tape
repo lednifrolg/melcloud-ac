@@ -1,6 +1,7 @@
 # The README's demo, recorded with vhs (https://github.com/charmbracelet/vhs) against the demo
-# server in crates/klima/examples, so no request reaches MELCloud. The README's development
-# section has the commands that make it and the screenshots.
+# server in crates/klima/examples, so no request reaches MELCloud. From the repository root:
+#
+#   cargo build -p klima --bin klima --examples && vhs assets/demo.tape
 
 Output "assets/demo.gif"
 
