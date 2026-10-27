@@ -16,6 +16,3 @@ session.json
 # Build output
 /target/
 __pycache__/
-
-# Recordings that only feed the README's screenshots.
-/assets/*.mp4
