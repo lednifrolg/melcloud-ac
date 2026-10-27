@@ -90,6 +90,15 @@ impl App {
         Ok(session)
     }
 
+    /// The device list as last fetched, however old, or a fetched one when there is none yet.
+    /// For what needs only names and IDs, which rarely change.
+    pub async fn known_devices(&self) -> Result<Cached<DeviceList>, AppError> {
+        match cache::load::<DeviceList>(&self.paths.devices()) {
+            Some(cached) => Ok(cached),
+            None => self.devices(true).await,
+        }
+    }
+
     /// The device list: cached for a day unless `fresh`.
     pub async fn devices(&self, fresh: bool) -> Result<Cached<DeviceList>, AppError> {
         let path = self.paths.devices();
@@ -129,7 +138,8 @@ impl App {
         check_device(device, &state)?;
         let now = Timestamp::now();
         cache::store(&self.paths.state_of(device.id), &state, now)?;
-        cache::record_history(&self.paths, state.view(), now)?;
+        // The history is a convenience: a read that worked stays a success without it.
+        let _ = cache::record_history(&self.paths, state.view(), now);
         Ok(Cached {
             fetched_at: now,
             value: state,

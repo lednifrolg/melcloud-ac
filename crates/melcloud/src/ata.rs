@@ -10,6 +10,7 @@ use serde_json::{Map, Value};
 
 use crate::devices::DeviceId;
 use crate::flags::EffectiveFlags;
+use crate::text::printable;
 use crate::time::utc;
 
 /// `ErrorCode` a unit reports when it has no error.
@@ -339,7 +340,7 @@ impl From<RawWeather> for WeatherObservation {
             time: raw.date,
             temperature: raw.temperature,
             humidity: raw.humidity,
-            condition: raw.condition_name,
+            condition: printable(raw.condition_name),
             icon: raw.icon,
             sunrise: raw.sunrise,
             sunset: raw.sunset,
@@ -433,7 +434,7 @@ impl From<RawAtaView> for AtaView {
             last_communication: raw.last_communication.and_then(utc),
             next_communication: raw.next_communication.and_then(utc),
             error_code: raw.error_code,
-            error_message: raw.error_message,
+            error_message: raw.error_message.map(printable),
             weather: raw
                 .weather_observations
                 .into_iter()

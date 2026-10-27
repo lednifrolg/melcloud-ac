@@ -67,11 +67,12 @@ temperature scale, the weather at the building, the adapter's WiFi and last cont
 the last 24 hours and an activity log. The chart draws the room temperature, and the target
 while the unit runs, over clock hours with a band underneath for when the unit was off or
 running and in which mode; it is built from every read of the unit, by the TUI and by commands
-alike, and leaves gaps where nothing was read. `klima history` shows the same in the shell; the
-history keeps 90 days. The TUI refreshes on its own every 10 minutes within the request budget,
-shows the countdown and the budget in the status line, and picks up changes made by `klima`
-commands in other terminals at once. While the unit runs, the fan turns at its speed and
-swinging vanes sweep; set `animations = false` for a still screen.
+alike, and leaves gaps where nothing was read. In the shell, `klima history` draws the room
+temperature and the modes and lists the changes of the settings; the history keeps 90 days. The
+TUI refreshes on its own every 10 minutes within the request budget, shows the countdown and the
+budget in the status line, and picks up changes made by `klima` commands in other terminals at
+once. While the unit runs, the fan turns at its speed and swinging vanes sweep; set `animations
+= false` for a still screen.
 
 To change the unit, select a setting with `↑`/`↓` (or `k`/`j`) and change it with `←`/`→` (or
 `h`/`l`), or use `+`/`-` for the temperature, `m` mode, `f` fan, `s`/`S` swing and `P` power. The

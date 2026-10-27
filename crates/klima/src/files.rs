@@ -54,23 +54,18 @@ pub fn replace(
 ) -> Result<(), AppError> {
     let dir = parent(path);
     private_dir(dir)?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temporary = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    let result = OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&temporary)
-        .and_then(|mut file| {
-            write(&mut file)?;
-            file.sync_all()
-        })
-        .and_then(|()| fs::rename(&temporary, path));
-    result.map_err(|e| {
-        let _ = fs::remove_file(&temporary);
-        AppError::io(path, e)
-    })
+    // A random name, created exclusively with owner-only permissions; deleted again on failure.
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".klima-")
+        .tempfile_in(dir)
+        .map_err(|e| AppError::io(dir, e))?;
+    write(temporary.as_file_mut())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|e| AppError::io(path, e))?;
+    temporary
+        .persist(path)
+        .map_err(|e| AppError::io(path, e.error))?;
+    Ok(())
 }
 
 /// Holds an exclusive lock on the file at `path` until the returned file is dropped; klima

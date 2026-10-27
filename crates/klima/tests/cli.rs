@@ -438,21 +438,109 @@ async fn history_charts_the_day_and_lists_the_changes_without_reading_the_unit()
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     let text = stdout(&output);
     assert!(
-        text.starts_with("Living room · last 24 h · 6 samples\n"),
+        text.starts_with("Living room · last 24h · 6 samples · room 21.5 °C\n"),
         "{text}"
     );
-    assert!(text.contains("room 21.5-21.5°"), "{text}");
-    assert!(text.contains("now\n\nCHANGED"), "{text}");
+    let band = text.lines().find(|line| line.starts_with("mode ")).unwrap();
+    assert!(
+        band.trim_end().ends_with("······hhhhhhcccc"),
+        "letters tell the modes apart without colors: {text}"
+    );
+    assert!(text.contains("now\n\nFROM "), "{text}");
     let changes: Vec<&str> = text
         .lines()
-        .skip_while(|line| !line.starts_with("CHANGED"))
+        .skip_while(|line| !line.starts_with("FROM"))
         .collect();
-    assert_eq!(changes.len(), 5, "header and four changes: {text}");
-    assert!(changes[1].contains("off    heat  22.0 °C"), "{text}");
-    assert!(changes[2].contains("on     heat  22.0 °C"), "{text}");
-    assert!(changes[3].contains("on     heat  23.5 °C"), "{text}");
-    assert!(changes[4].contains("on     cool  23.5 °C"), "{text}");
+    assert_eq!(
+        changes.len(),
+        5,
+        "header, the first state and three changes: {text}"
+    );
+    assert!(
+        changes[0].ends_with("POWER  MODE   TARGET  FAN      ROOM"),
+        "{text}"
+    );
+    assert!(
+        changes[1].ends_with("off    heat  22.0 °C  auto  21.5 °C"),
+        "{text}"
+    );
+    assert!(
+        changes[2].ends_with("on     heat  22.0 °C  auto  21.5 °C"),
+        "{text}"
+    );
+    assert!(
+        changes[3].ends_with("on     heat  23.5 °C  auto  21.5 °C"),
+        "{text}"
+    );
+    assert!(
+        changes[4].ends_with("on     cool  23.5 °C  auto  21.5 °C"),
+        "{text}"
+    );
     assert_eq!(klima.requests_to("/Device/Get").await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_works_offline_with_an_old_device_list() {
+    let klima = Klima::new().await;
+    klima.login_for(SignedDuration::from_hours(1)).await;
+    klima.mock_account().await;
+    let devices = klima.run(&["devices"]).await;
+    assert_eq!(code(&devices), 0, "{}", stderr(&devices));
+    let cached = klima.file("cache/devices.json");
+    let mut list: Value = serde_json::from_str(&fs::read_to_string(&cached).unwrap()).unwrap();
+    list["fetched_at"] = json!(Timestamp::now() - SignedDuration::from_hours(24 * 30));
+    fs::write(&cached, list.to_string()).unwrap();
+    fs::remove_file(klima.file("state/session.json")).unwrap();
+    write_history(&klima, &[(60, true, "cool", 23.5)]);
+    let before = klima.server.received_requests().await.unwrap().len();
+
+    let output = klima.run(&[&LIVING_ROOM[..], &["history"]].concat()).await;
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("· 1 sample ·"),
+        "{}",
+        stdout(&output)
+    );
+    let after = klima.server.received_requests().await.unwrap().len();
+    assert_eq!(after, before, "asks MELCloud for nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_lists_the_latest_changes_and_counts_the_rest() {
+    let klima = Klima::new().await;
+    klima.login_for(SignedDuration::from_hours(1)).await;
+    klima.mock_account().await;
+    let samples: Vec<(i64, bool, &str, f64)> = (0..30)
+        .map(|i| {
+            (
+                300 - i * 10,
+                true,
+                "heat",
+                20.0 + f64::from(i32::try_from(i).unwrap()) / 2.0,
+            )
+        })
+        .collect();
+    write_history(&klima, &samples);
+
+    let output = klima.run(&[&LIVING_ROOM[..], &["history"]].concat()).await;
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("10 earlier changes left out; --json lists every sample"),
+        "{}",
+        stderr(&output)
+    );
+    let text = stdout(&output);
+    let rows = text
+        .lines()
+        .skip_while(|line| !line.starts_with("FROM"))
+        .count();
+    assert_eq!(rows, 21, "header and 20 rows: {text}");
+    assert!(
+        text.trim_end().ends_with("34.5 °C  auto  21.5 °C"),
+        "{text}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

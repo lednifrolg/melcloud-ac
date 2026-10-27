@@ -1,16 +1,29 @@
 //! The unit's history over time, laid out the same way by the command line and the TUI.
 
 use jiff::tz::TimeZone;
-use jiff::{RoundMode, SignedDuration, Timestamp, Unit, ZonedRound};
+use jiff::{RoundMode, SignedDuration, Timestamp, Unit, Zoned, ZonedRound};
+use melcloud::OperationMode;
 
 use crate::cache::Sample;
 
 /// Samples further apart are not joined: the unit was not read in between.
 pub const GAP: SignedDuration = SignedDuration::from_mins(45);
 
-/// Hours between time labels, the shortest that leaves about a dozen columns per label.
-const LABEL_HOURS: [i64; 10] = [1, 2, 3, 6, 12, 24, 48, 168, 336, 720];
+/// Minutes between time labels: the shortest step that leaves about a dozen columns per label.
+const LABEL_MINUTES: [i64; 14] = [
+    5, 10, 15, 30, 60, 120, 180, 360, 720, 1440, 2880, 10_080, 20_160, 43_200,
+];
 const COLUMNS_PER_LABEL: usize = 12;
+const DAY_MINUTES: i64 = 1440;
+
+/// What the unit did during one column of a chart.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Column {
+    /// Mean room temperature of the samples in the column.
+    pub room: f64,
+    /// The mode the unit ran in for most of the column; `None` when it was mostly off.
+    pub running: Option<OperationMode>,
+}
 
 /// A span of time up to now, drawn `width` columns wide.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,65 +51,109 @@ impl Timeline {
         self.since + SignedDuration::from_nanos(i64::try_from(offset).unwrap_or(i64::MAX))
     }
 
-    /// The state of the unit during each column: the latest sample read before the column ends,
-    /// or nothing when the unit went unread for longer than [`GAP`] before it. `samples` are
-    /// oldest first.
-    pub fn columns<'a>(&self, samples: &'a [Sample]) -> Vec<Option<&'a Sample>> {
+    /// What the unit did in each column, from the samples read in it. A column without samples
+    /// takes the state from the sample before it, unless the unit went unread for longer than
+    /// [`GAP`]; then it is `None`. `samples` are oldest first.
+    pub fn columns(&self, samples: &[Sample]) -> Vec<Option<Column>> {
         (0..self.width)
             .map(|index| {
                 let start = self.column_start(index);
                 let end = self.column_start(index + 1);
-                let read = samples.partition_point(|s| s.at < end);
-                read.checked_sub(1)
-                    .map(|last| &samples[last])
-                    .filter(|s| start.duration_since(s.at) <= GAP)
+                let first = samples.partition_point(|s| s.at < start);
+                let last = samples.partition_point(|s| s.at < end).max(first);
+                let inside = &samples[first..last];
+                let before = first
+                    .checked_sub(1)
+                    .map(|i| &samples[i..=i])
+                    .filter(|before| start.duration_since(before[0].at) <= GAP);
+                summarize(if inside.is_empty() {
+                    before.unwrap_or_default()
+                } else {
+                    inside
+                })
             })
             .collect()
     }
 
-    /// Times under the columns, `width` characters: clock hours, or days at midnight for long
+    /// Times under the columns, `width` characters: clock times, or days at midnight for long
     /// spans, as many as fit, with "now" at the right edge.
     pub fn axis(&self, tz: &TimeZone) -> String {
         let fit = i64::try_from(self.width / COLUMNS_PER_LABEL)
             .unwrap_or(i64::MAX)
             .max(1);
-        let hours = self.span().as_hours();
-        let step = LABEL_HOURS
+        let minutes = self.span().as_mins();
+        let step = LABEL_MINUTES
             .into_iter()
-            .find(|step| hours / step <= fit)
-            .unwrap_or(LABEL_HOURS[LABEL_HOURS.len() - 1]);
+            .find(|step| minutes / step <= fit)
+            .unwrap_or(LABEL_MINUTES[LABEL_MINUTES.len() - 1]);
         let last = self.width.saturating_sub(1);
         let mut marks = vec![(last, "now".to_owned())];
-        let (unit, every, format) = if step < 24 {
-            (Unit::Hour, step, "%H:%M")
-        } else {
-            (Unit::Day, step / 24, "%a %d")
+        let mut mark = |at: &Zoned, format: &str| {
+            let column = cell(self.share(at.timestamp()), last);
+            marks.push((column, at.strftime(format).to_string()));
         };
-        let mut next = self
-            .since
-            .to_zoned(tz.clone())
-            .round(ZonedRound::new().smallest(unit).mode(RoundMode::Ceil))
-            .ok();
-        let mut count = 0;
-        while let Some(at) = next.take().filter(|at| at.timestamp() < self.now) {
-            let due = if unit == Unit::Hour {
-                i64::from(at.hour()) % every == 0
+        let start = self.since.to_zoned(tz.clone());
+        let before_now = |at: &Zoned| at.timestamp() < self.now;
+        if step < DAY_MINUTES {
+            let (unit, increment) = if step < 60 {
+                (Unit::Minute, step)
             } else {
-                count % every == 0
+                (Unit::Hour, step / 60)
             };
-            if due {
-                let column = cell(self.share(at.timestamp()), last);
-                marks.push((column, at.strftime(format).to_string()));
+            // Rounding after every step keeps the labels on round clock times across a shift
+            // of the clock that is not a whole step, like half an hour.
+            let align = |at: Zoned| {
+                let round = ZonedRound::new()
+                    .smallest(unit)
+                    .increment(increment)
+                    .mode(RoundMode::Ceil);
+                at.round(round).ok()
+            };
+            let mut next = align(start);
+            while let Some(at) = next.take().filter(before_now) {
+                mark(&at, "%H:%M");
+                next = at
+                    .checked_add(SignedDuration::from_mins(step))
+                    .ok()
+                    .and_then(align);
             }
-            count += 1;
-            next = if unit == Unit::Hour {
-                at.checked_add(SignedDuration::from_hours(1)).ok()
+        } else {
+            // Weekdays within a week, dates beyond.
+            let format = if self.span() <= SignedDuration::from_hours(24 * 7) {
+                "%a %d"
             } else {
-                at.tomorrow().ok()
+                "%b %d"
             };
+            let every = step / DAY_MINUTES;
+            let mut next = start
+                .round(ZonedRound::new().smallest(Unit::Day).mode(RoundMode::Ceil))
+                .ok();
+            let mut count = 0;
+            while let Some(at) = next.take().filter(before_now) {
+                if count % every == 0 {
+                    mark(&at, format);
+                }
+                count += 1;
+                // From the start of each day, which is not always midnight.
+                next = at.tomorrow().and_then(|day| day.start_of_day()).ok();
+            }
         }
         place(&mut marks, self.width)
     }
+}
+
+/// The mean room temperature of `samples` and the state they were in most often; `None` when
+/// there are none.
+fn summarize(samples: &[Sample]) -> Option<Column> {
+    let count = u32::try_from(samples.len()).ok().filter(|&n| n > 0)?;
+    let room = samples.iter().map(|s| s.room).sum::<f64>() / f64::from(count);
+    let state = |s: &Sample| s.power.then_some(s.mode);
+    // The latest of the most frequent states wins a tie.
+    let running = samples
+        .iter()
+        .map(state)
+        .max_by_key(|candidate| samples.iter().filter(|s| state(s) == *candidate).count())?;
+    Some(Column { room, running })
 }
 
 /// The cell for `share` (0 to 1) of a scale whose last cell is `last`.
@@ -136,88 +193,125 @@ fn place(marks: &mut [(usize, String)], width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use melcloud::OperationMode;
-
     use super::*;
 
     fn at(text: &str) -> Timestamp {
         text.parse().unwrap()
     }
 
-    fn sample(time: &str, power: bool) -> Sample {
+    fn sample(time: &str, power: bool, mode: OperationMode, room: f64) -> Sample {
         Sample {
             at: at(time),
             power,
-            mode: OperationMode::Heat,
+            mode,
             target: 22.0,
-            room: 21.0,
+            room,
             outside: None,
             fan: None,
         }
     }
 
-    fn day(width: usize) -> Timeline {
+    fn timeline(hours: i64, width: usize) -> Timeline {
         let now = at("2026-01-15T10:05:30Z");
         Timeline {
-            since: now - SignedDuration::from_hours(24),
+            since: now - SignedDuration::from_hours(hours),
             now,
             width,
         }
     }
 
+    fn spaced(parts: &[(usize, &str)]) -> String {
+        parts
+            .iter()
+            .map(|&(spaces, label)| " ".repeat(spaces) + label)
+            .collect()
+    }
+
     #[test]
     fn the_axis_shows_clock_hours_up_to_now() {
-        let axis = |width| day(width).axis(&TimeZone::UTC);
+        let axis = |width| timeline(24, width).axis(&TimeZone::UTC);
         assert_eq!(
             axis(50),
-            "  12:00       18:00       00:00        06:00   now"
+            spaced(&[
+                (2, "12:00"),
+                (7, "18:00"),
+                (7, "00:00"),
+                (8, "06:00"),
+                (3, "now")
+            ])
         );
-        assert_eq!(axis(30), "12:00          00:00       now");
+        assert_eq!(axis(30), spaced(&[(0, "12:00"), (10, "00:00"), (7, "now")]));
         assert_eq!(
             axis(12),
-            format!("{}now", " ".repeat(9)),
-            "a day label too close to now is left out"
+            spaced(&[(9, "now")]),
+            "a label too close to now is left out"
         );
-        let zone = TimeZone::fixed(jiff::tz::offset(1));
+        let plus_one = TimeZone::fixed(jiff::tz::offset(1));
         assert_eq!(
-            day(50).axis(&zone),
-            format!(
-                "12:00{}18:00{}00:00{}06:00{}now",
-                " ".repeat(7),
-                " ".repeat(7),
-                " ".repeat(8),
-                " ".repeat(5)
-            ),
+            timeline(24, 50).axis(&plus_one),
+            spaced(&[
+                (0, "12:00"),
+                (7, "18:00"),
+                (7, "00:00"),
+                (8, "06:00"),
+                (5, "now")
+            ]),
             "hours are local"
         );
     }
 
     #[test]
-    fn a_week_is_labelled_by_days() {
-        let now = at("2026-01-15T10:05:30Z");
-        let week = Timeline {
-            since: now - SignedDuration::from_hours(24 * 7),
-            now,
-            width: 60,
-        };
+    fn short_spans_are_labelled_in_minutes() {
         assert_eq!(
-            week.axis(&TimeZone::UTC),
-            format!(
-                "{}Fri 09{}Sun 11{}Tue 13{}now",
-                " ".repeat(2),
-                " ".repeat(11),
-                " ".repeat(11),
-                " ".repeat(15)
-            ),
-            "every other day, at midnight"
+            timeline(1, 60).axis(&TimeZone::UTC),
+            spaced(&[(7, "09:15"), (10, "09:30"), (10, "09:45"), (15, "now")])
         );
     }
 
     #[test]
-    fn columns_follow_the_latest_sample_until_a_gap() {
+    fn long_spans_are_labelled_by_days_then_dates() {
+        assert_eq!(
+            timeline(24 * 7, 60).axis(&TimeZone::UTC),
+            spaced(&[(2, "Fri 09"), (11, "Sun 11"), (11, "Tue 13"), (15, "now")]),
+            "every other day within a week"
+        );
+        let month = timeline(24 * 30, 60).axis(&TimeZone::UTC);
+        assert!(month.starts_with("Dec 17"), "weekly: {month}");
+        assert!(
+            month.contains("Jan 07") && month.ends_with("now"),
+            "{month}"
+        );
+    }
+
+    #[test]
+    fn labels_stay_on_round_times_across_a_half_hour_clock_change() {
+        // Lord Howe Island moves its clocks by 30 minutes, here on 2026-10-04.
+        let zone = TimeZone::posix("<+1030>-10:30<+11>-11,M10.1.0,M4.1.0").unwrap();
+        let now = at("2026-10-04T12:00:00Z");
+        let day = Timeline {
+            since: now - SignedDuration::from_hours(24),
+            now,
+            width: 100,
+        };
+        let axis = day.axis(&zone);
+        let labels: Vec<&str> = axis.split_whitespace().collect();
+        assert!(labels.len() > 4, "{axis}");
+        for label in &labels[..labels.len() - 1] {
+            let (hour, minute) = label.split_once(':').unwrap();
+            assert_eq!(minute, "00", "{axis}");
+            assert_eq!(hour.parse::<u32>().unwrap() % 3, 0, "{axis}");
+        }
+    }
+
+    #[test]
+    fn columns_summarize_their_samples_and_stop_at_a_gap() {
+        let heat = OperationMode::Heat;
+        let cool = OperationMode::Cool;
         let samples = [
-            sample("2026-01-15T06:00:00Z", false),
-            sample("2026-01-15T07:00:00Z", true),
+            sample("2026-01-15T06:00:00Z", false, heat, 20.0),
+            sample("2026-01-15T07:00:00Z", true, heat, 21.0),
+            sample("2026-01-15T07:10:00Z", true, cool, 22.0),
+            sample("2026-01-15T07:20:00Z", true, cool, 23.0),
         ];
         let now = at("2026-01-15T10:00:00Z");
         let timeline = Timeline {
@@ -225,16 +319,23 @@ mod tests {
             now,
             width: 10,
         };
-        let shown: String = timeline
-            .columns(&samples)
+        let columns = timeline.columns(&samples);
+        let shown: String = columns
             .iter()
             .map(|column| match column {
                 None => ' ',
-                Some(s) if s.power => '▀',
-                Some(_) => '·',
+                Some(Column { running: None, .. }) => '·',
+                Some(Column {
+                    running: Some(OperationMode::Cool),
+                    ..
+                }) => 'c',
+                Some(_) => 'h',
             })
             .collect();
-        // Columns of 30 min from 05:00: off from 06:00, on from 07:00 until 45 min after it.
-        assert_eq!(shown, "  ··▀▀    ");
+        // 30 min columns from 05:00: off from 06:00, mostly cool from 07:00, and on until 45 min
+        // after the last sample.
+        assert_eq!(shown, "  ··ccc   ");
+        assert_eq!(columns[4].unwrap().room, 22.0, "the mean of 21, 22 and 23");
+        assert_eq!(columns[5].unwrap().room, 23.0, "the last sample carries on");
     }
 }

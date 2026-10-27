@@ -93,17 +93,18 @@ pub fn history(paths: &Paths, device: DeviceId, since: Timestamp) -> Vec<Sample>
         #[serde(default)]
         fan: Option<String>,
     }
-    let Ok(text) = std::fs::read_to_string(paths.history()) else {
+    let Ok(bytes) = std::fs::read(paths.history()) else {
         return Vec::new();
     };
-    let mut samples: Vec<Sample> = text
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Stored>(line).ok())
+    // Line by line as bytes, so one damaged line costs only itself.
+    let mut samples: Vec<Sample> = bytes
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Stored>(line).ok())
         .filter(|stored| stored.device == device && stored.at >= since)
         .map(|stored| Sample {
             at: stored.at,
             power: stored.power,
-            mode: stored.mode.parse().unwrap_or(OperationMode::Other(0)),
+            mode: stored_mode(&stored.mode),
             target: stored.target,
             room: stored.room,
             outside: stored.outside,
@@ -115,7 +116,18 @@ pub fn history(paths: &Paths, device: DeviceId, since: Timestamp) -> Vec<Sample>
     samples
 }
 
-/// Appends a state read from the server to the history used for charts.
+/// A mode as the history stores it: its name, or `mode N` for a code klima has no name for.
+fn stored_mode(text: &str) -> OperationMode {
+    text.parse().unwrap_or_else(|_| {
+        let code = text
+            .strip_prefix("mode ")
+            .and_then(|code| code.parse().ok());
+        OperationMode::Other(code.unwrap_or(0))
+    })
+}
+
+/// Adds a state read from the server to the history used for charts, after dropping what is no
+/// longer kept.
 pub fn record_history(paths: &Paths, view: &AtaView, now: Timestamp) -> Result<(), AppError> {
     let record = Record {
         at: now,
@@ -134,8 +146,9 @@ pub fn record_history(paths: &Paths, view: &AtaView, now: Timestamp) -> Result<(
         error_message: view.error_message.as_deref(),
     };
     let _lock = files::lock(&paths.history_lock())?;
+    let pruned = prune_history(&paths.history(), now);
     append_json_line(&paths.history(), &record)?;
-    prune_history(&paths.history(), now)
+    pruned
 }
 
 /// Drops states older than [`HISTORY_KEPT`] once the oldest is a day past it, so the file is
@@ -145,29 +158,45 @@ fn prune_history(path: &Path, now: Timestamp) -> Result<(), AppError> {
     struct Stored {
         at: Timestamp,
     }
-    let cutoff = now - HISTORY_KEPT;
-    let read_at = |line: &str| serde_json::from_str::<Stored>(line).ok().map(|s| s.at);
-    let mut first = String::new();
-    File::open(path)
-        .and_then(|file| BufReader::new(file).read_line(&mut first))
-        .map_err(|e| AppError::io(path, e))?;
-    let due = read_at(&first).is_none_or(|at| at < cutoff - SignedDuration::from_hours(24));
-    if first.is_empty() || !due {
+    let read_at = |line: &[u8]| serde_json::from_slice::<Stored>(line).ok().map(|s| s.at);
+    let mut first = Vec::new();
+    match File::open(path) {
+        Ok(file) => BufReader::new(file)
+            .read_until(b'\n', &mut first)
+            .map_err(|e| AppError::io(path, e))?,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(AppError::io(path, e)),
+    };
+    let day = SignedDuration::from_hours(24);
+    let first = first.strip_suffix(b"\n").unwrap_or(&first);
+    if first.is_empty() || read_at(first).is_some_and(|at| at >= now - HISTORY_KEPT - day) {
         return Ok(());
     }
-    let text = std::fs::read_to_string(path).map_err(|e| AppError::io(path, e))?;
-    let kept: String = text
-        .lines()
-        .filter(|line| read_at(line).is_some_and(|at| at >= cutoff))
-        .flat_map(|line| [line, "\n"])
+    let bytes = std::fs::read(path).map_err(|e| AppError::io(path, e))?;
+    let lines: Vec<(&[u8], Timestamp)> = bytes
+        .split(|&byte| byte == b'\n')
+        .filter_map(|line| Some((line, read_at(line)?)))
         .collect();
-    files::replace(path, |file: &mut File| -> io::Result<()> {
-        file.write_all(kept.as_bytes())
-    })
+    // Counted from the newest state when the clock runs ahead of it, so a clock set wrong does
+    // not throw the history away.
+    let newest = lines.iter().map(|&(_, at)| at).max().unwrap_or(now);
+    let cutoff = now.min(newest) - HISTORY_KEPT;
+    let kept: Vec<u8> = lines
+        .iter()
+        .filter(|&&(_, at)| at >= cutoff)
+        .flat_map(|&(line, _)| line.iter().chain(b"\n"))
+        .copied()
+        .collect();
+    if kept.len() == bytes.len() {
+        return Ok(());
+    }
+    files::replace(path, |file: &mut File| file.write_all(&kept))
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[test]
@@ -210,7 +239,7 @@ mod tests {
                 Sample {
                     at: "2026-01-15T10:00:00Z".parse().unwrap(),
                     power: true,
-                    mode: OperationMode::Other(0),
+                    mode: OperationMode::Other(9),
                     target: 22.5,
                     room: 21.5,
                     outside: Some(-3.5),
@@ -230,21 +259,68 @@ mod tests {
             format!(r#"{{"at":"{at}","device":1}}"#)
         };
         let write = |lines: &[String]| std::fs::write(&path, lines.join("\n") + "\n").unwrap();
-        let lines = || std::fs::read_to_string(&path).unwrap().lines().count();
+        let read = || std::fs::read_to_string(&path).unwrap();
 
         write(&[line(90), line(10), line(1)]);
         prune_history(&path, now).unwrap();
-        assert_eq!(lines(), 3, "the oldest is not a day past 90 days yet");
-
-        write(&[line(92), line(91), "not json".into(), line(10), line(1)]);
-        prune_history(&path, now).unwrap();
         assert_eq!(
-            std::fs::read_to_string(&path).unwrap(),
-            [line(10), line(1)].join("\n") + "\n"
+            read().lines().count(),
+            3,
+            "the oldest is not a day past 90 days yet"
         );
+
+        write(&[line(95), line(93), "not json".into(), line(10), line(1)]);
+        prune_history(&path, now).unwrap();
+        assert_eq!(read(), [line(10), line(1)].join("\n") + "\n");
 
         std::fs::write(&path, "").unwrap();
         prune_history(&path, now).unwrap();
-        assert_eq!(lines(), 0);
+        assert_eq!(read(), "");
+        std::fs::remove_file(&path).unwrap();
+        prune_history(&path, now).unwrap();
+    }
+
+    #[test]
+    fn a_clock_far_ahead_does_not_empty_the_history() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("history.jsonl");
+        let now: Timestamp = "2026-06-01T12:00:00Z".parse().unwrap();
+        let lines = format!(
+            "{}\n{}\n",
+            json!({"at": now - SignedDuration::from_hours(24 * 30), "device": 1}),
+            json!({"at": now, "device": 1}),
+        );
+        std::fs::write(&path, &lines).unwrap();
+        let wrong = now + SignedDuration::from_hours(24 * 200);
+        prune_history(&path, wrong).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), lines);
+    }
+
+    #[test]
+    fn a_damaged_line_costs_only_itself() {
+        let home = tempfile::tempdir().unwrap();
+        let paths = Paths::under(home.path());
+        std::fs::create_dir_all(paths.history().parent().unwrap()).unwrap();
+        let good = r#"{"at":"2026-01-15T09:00:00Z","device":1000001,"power":true,"mode":"mode 11","target":22.0,"room":21.0}"#;
+        let mut bytes = b"\xff\xfe torn\n".to_vec();
+        bytes.extend_from_slice(good.as_bytes());
+        bytes.extend_from_slice(b"\n{\"at\":\"2026-01-15T09:05:00Z\",\"room\":\xe2\x82\n");
+        std::fs::write(paths.history(), &bytes).unwrap();
+        let since = "2026-01-15T00:00:00Z".parse().unwrap();
+        let samples = history(&paths, DeviceId(1_000_001), since);
+        assert_eq!(samples.len(), 1);
+        assert_eq!(
+            samples[0].mode,
+            OperationMode::Other(11),
+            "unknown codes survive"
+        );
+
+        let much_later = "2026-06-01T00:00:00Z".parse().unwrap();
+        prune_history(&paths.history(), much_later).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(paths.history()).unwrap(),
+            format!("{good}\n"),
+            "damaged lines are dropped with the next pruning"
+        );
     }
 }

@@ -8,7 +8,7 @@ use melcloud::{AtaState, Device};
 
 use crate::app::App;
 use crate::cache::{self, Cached, HISTORY_KEPT, STATE_TTL};
-use crate::chart;
+use crate::chart::{self, Timeline};
 use crate::error::AppError;
 use crate::governor::{self, Refusal, Request};
 use crate::output::{self, Source, StatusReport};
@@ -202,31 +202,43 @@ pub async fn status(
 }
 
 /// `klima history`: states of the unit read in the last `span`, at most as far back as the
-/// history is kept. Asks MELCloud for nothing but the device list, and only when the cached one
-/// is a day old.
+/// history is kept. Asks MELCloud for nothing, except for the device list when none was ever
+/// fetched.
 pub async fn history(
     app: &App,
     wanted: Option<&str>,
     span: Span,
     json: bool,
 ) -> Result<(), AppError> {
-    let list = app.devices(false).await?;
+    let list = app.known_devices().await?;
     let wanted = wanted.or(app.config.device.as_deref());
     let device = select(list.value.devices(), wanted)?;
     let now = Timestamp::now();
     let tz = TimeZone::system();
     // Nothing older is kept.
     let oldest = now - HISTORY_KEPT;
-    let since = now
+    let asked = now
         .to_zoned(tz.clone())
         .checked_sub(span)
-        .map_or(oldest, |since| since.timestamp().max(oldest));
+        .map(|since| since.timestamp())
+        .ok()
+        .filter(|&since| since >= oldest);
+    let since = asked.unwrap_or(oldest);
     // A little more, so the chart can show the state the unit was in at its left edge.
     let samples = cache::history(&app.paths, device.id, since - chart::GAP);
     if json {
         output::history_json(device, since, &samples);
     } else {
-        output::history(device, since, now, &samples, &tz);
+        let span = match asked {
+            Some(_) => format!("{span:#}"),
+            None => format!("{} days, all that is kept", HISTORY_KEPT.as_hours() / 24),
+        };
+        let timeline = Timeline {
+            since,
+            now,
+            width: 0,
+        };
+        output::history(device, &span, timeline, &samples, &tz);
     }
     Ok(())
 }

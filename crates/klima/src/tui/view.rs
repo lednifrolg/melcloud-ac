@@ -25,7 +25,7 @@ use super::model::{
 };
 use super::widgets::{BIG_TEXT_HEIGHT, BigText, scale};
 use crate::cache::Sample;
-use crate::chart::{GAP, Timeline};
+use crate::chart::{Column, GAP, Timeline};
 use crate::control;
 use crate::governor::HOURLY_LIMIT;
 use crate::output::{ago, duration};
@@ -735,6 +735,16 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
         );
         return;
     }
+    // The legend sits on the border, away from the values on the left that it could be read as.
+    let mut legend = vec![" ".into(), Span::styled("━ room", Style::new().fg(ROOM))];
+    if samples.iter().any(|s| s.power) {
+        legend.extend([
+            "  ".into(),
+            Span::styled("━ target", Style::new().fg(TARGET)),
+        ]);
+    }
+    legend.push(" ".into());
+    block = block.title_bottom(Line::from(legend).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [plot_rows, ribbon_row, axis_row] = Layout::vertical([
@@ -766,13 +776,6 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
     if let [first, .., last] = label_lines.as_mut_slice() {
         *first = Line::styled(format!("{high:.1}°"), DIM);
         *last = Line::styled(format!("{low:.1}°"), DIM);
-    }
-    let middle = label_lines.len() / 2;
-    if label_lines.len() >= 3 {
-        label_lines[middle] = Line::styled("room", Style::new().fg(ROOM));
-    }
-    if label_lines.len() >= 5 && samples.iter().any(|s| s.power) {
-        label_lines[middle + 1] = Line::styled("target", Style::new().fg(TARGET));
     }
     frame.render_widget(Paragraph::new(label_lines), labels);
     frame.render_widget(Line::styled("mode", DIM), ribbon_label);
@@ -837,10 +840,13 @@ fn mode_ribbon(timeline: &Timeline, samples: &[Sample]) -> Line<'static> {
     let cells = timeline
         .columns(samples)
         .into_iter()
-        .map(|state| match state {
-            Some(s) if s.power => Span::styled(
+        .map(|column| match column {
+            Some(Column {
+                running: Some(mode),
+                ..
+            }) => Span::styled(
                 "▀",
-                Style::new().fg(Color::Indexed(theme::mode_color(s.mode))),
+                Style::new().fg(Color::Indexed(theme::mode_color(mode))),
             ),
             Some(_) => Span::styled("·", DIM),
             None => " ".into(),
@@ -848,11 +854,20 @@ fn mode_ribbon(timeline: &Timeline, samples: &[Sample]) -> Line<'static> {
     Line::from(cells.collect::<Vec<_>>())
 }
 
-/// Splits `text` into lines of at most `width` characters at spaces; a longer word gets its own
-/// line.
+/// Splits `text` into lines of at most `width` characters at spaces; a longer word, like a URL,
+/// is broken where the line ends.
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     let mut lines: Vec<String> = Vec::new();
-    for word in text.split_whitespace() {
+    let chars = |word: &str| word.chars().collect::<Vec<_>>();
+    let pieces = text.split_whitespace().flat_map(|word| {
+        chars(word)
+            .chunks(width)
+            .map(|piece| piece.iter().collect::<String>())
+            .collect::<Vec<_>>()
+    });
+    for word in pieces {
+        let word = word.as_str();
         match lines.last_mut() {
             Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
                 line.push(' ');
@@ -923,7 +938,12 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
     ];
     // Each segment has the rank it is dropped in when the window is narrow: highest first.
     let mut segments: Vec<(u8, Vec<Span>)> = Vec::new();
-    if let Some(view) = view {
+    if model.unreachable {
+        segments.push((
+            2,
+            vec![Span::styled("○ MELCloud unreachable", Style::new().fg(BAD))],
+        ));
+    } else if let Some(view) = view {
         let mut link = vec![if view.offline {
             Span::styled("○ offline", Style::new().fg(WARN))
         } else {
@@ -1342,7 +1362,7 @@ mod tests {
         );
         assert_eq!(
             wrap_words("a verylongword b", 4),
-            ["a", "verylongword", "b"]
+            ["a", "very", "long", "word", "b"]
         );
     }
 }

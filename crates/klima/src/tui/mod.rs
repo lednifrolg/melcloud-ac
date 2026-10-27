@@ -313,6 +313,10 @@ fn failure(error: &AppError) -> Failure {
         AppError::Refused(_) | AppError::Throttled { .. } | AppError::LoginLocked { .. } => {
             FailureKind::Blocked
         }
+        AppError::Api(melcloud::Error::Transport(_)) => FailureKind::Unreachable,
+        AppError::Api(melcloud::Error::Status { status, .. }) if *status >= 500 => {
+            FailureKind::Unreachable
+        }
         _ => FailureKind::Other,
     };
     Failure {

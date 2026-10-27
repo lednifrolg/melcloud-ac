@@ -70,9 +70,11 @@ enum Command {
         #[arg(long)]
         fresh: bool,
     },
-    /// Show how the room temperature and the settings changed, from states read before.
+    /// Show the room temperature and the setting changes klima recorded, without asking MELCloud.
+    ///
+    /// Every read of the unit, by a command or the TUI, is recorded; the history keeps 90 days.
     History {
-        /// How far back: 24h, 90m, 7d.
+        /// How far back, at most 90 days: 30m, 24h, 7d.
         #[arg(long, default_value = "24h", value_parser = past_span, value_name = "DURATION")]
         since: Span,
     },
@@ -146,10 +148,13 @@ enum Command {
     },
     /// Lift the local pause after MELCloud throttled the account (HTTP 429).
     Unblock,
-    /// Print a shell completion script, e.g. `klima completions zsh > ~/.zfunc/_klima`.
+    /// Print a shell completion script.
+    ///
+    /// For example: klima completions zsh > ~/.zfunc/_klima
     Completions { shell: Shell },
-    /// Write the man pages, one for klima and one per command, e.g. `klima man
-    /// ~/.local/share/man/man1`.
+    /// Write the man pages for klima and each of its commands into a directory.
+    ///
+    /// For example: klima man ~/.local/share/man/man1
     Man {
         /// Directory for the pages; created when missing.
         dir: PathBuf,
@@ -249,11 +254,17 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             return output::raw(&script);
         }
         Some(Command::Man { dir }) => {
+            if dir.exists() && !dir.is_dir() {
+                return Err(AppError::Usage(format!(
+                    "{} is not a directory",
+                    dir.display()
+                )));
+            }
             std::fs::create_dir_all(&dir)
                 .and_then(|()| clap_mangen::generate_to(Cli::command(), &dir))
                 .map_err(|e| AppError::io(&dir, e))?;
             output::success(format_args!(
-                "man pages written to {}; try `man klima`",
+                "man pages written to {0}; read one with `man -l {0}/klima.1`",
                 dir.display()
             ));
             return Ok(());

@@ -16,6 +16,7 @@ mod client;
 mod devices;
 mod error;
 mod flags;
+mod text;
 mod time;
 
 pub use ata::{

@@ -342,7 +342,7 @@ pub fn devices(devices: &[Device], fetched_at: Timestamp) {
         .into_iter()
         .map(|row| row.map(|cell| (cell, Style::new())))
         .collect();
-    table(header, &rows);
+    table(header, [false; 5], &rows);
     println!(
         "{}",
         paint(
@@ -352,8 +352,8 @@ pub fn devices(devices: &[Device], fetched_at: Timestamp) {
     );
 }
 
-/// A table with a dim header and columns as wide as their widest cell.
-fn table<const N: usize>(header: [&str; N], rows: &[[(String, Style); N]]) {
+/// A table with a dim header and columns as wide as their widest cell; `right` aligns numbers.
+fn table<const N: usize>(header: [&str; N], right: [bool; N], rows: &[[(String, Style); N]]) {
     let widths: [usize; N] = std::array::from_fn(|column| {
         rows.iter()
             .map(|row| row[column].0.chars().count())
@@ -368,8 +368,13 @@ fn table<const N: usize>(header: [&str; N], rows: &[[(String, Style); N]]) {
             .zip(widths)
             .enumerate()
             .map(|(column, ((text, style), width))| {
-                let width = if column + 1 == N { 0 } else { width };
-                paint(style, format!("{text:<width$}"))
+                if right[column] {
+                    paint(style, format!("{text:>width$}"))
+                } else if column + 1 == N {
+                    paint(style, text)
+                } else {
+                    paint(style, format!("{text:<width$}"))
+                }
             })
             .collect::<Vec<_>>()
             .join("  ")
@@ -623,63 +628,78 @@ mod tests {
     }
 }
 
-/// Width of the chart in `klima history`: the terminal's, or 80 columns when the output is not a
-/// terminal, so piped output does not depend on the window.
-fn chart_width(labels: usize) -> usize {
-    let columns = if io::stdout().is_terminal() {
+/// Width of the terminal, or 80 columns when the output is not a terminal, so piped output does
+/// not depend on the window.
+fn columns() -> usize {
+    if io::stdout().is_terminal() {
         ratatui::crossterm::terminal::size().map_or(80, |(width, _)| usize::from(width))
     } else {
         80
-    };
-    columns.saturating_sub(labels).clamp(24, 120)
+    }
 }
 
+/// Rows of the change table in `klima history`; `--json` has every sample.
+const HISTORY_ROWS: usize = 20;
+/// Width of the labels before the chart in `klima history`.
+const HISTORY_LABELS: usize = 5;
+
 /// `klima history`: the room temperature as a sparkline, the modes under it, and a table of the
-/// changes. `samples` may start a little before `since`, to show the state the unit was in then.
-pub fn history(
-    device: &Device,
-    since: Timestamp,
-    now: Timestamp,
-    samples: &[Sample],
-    tz: &TimeZone,
-) {
-    let shown: Vec<&Sample> = samples.iter().filter(|s| s.at >= since).collect();
+/// changes of the settings. `samples` may start a little before `since`, to show the state the
+/// unit was in then; `span` describes the window.
+pub fn history(device: &Device, span: &str, timeline: Timeline, samples: &[Sample], tz: &TimeZone) {
+    let shown: Vec<&Sample> = samples.iter().filter(|s| s.at >= timeline.since).collect();
     let count = match shown.len() {
         1 => "1 sample".to_owned(),
         n => format!("{n} samples"),
     };
-    println!(
-        "{}{}",
-        paint(BOLD, &device.name),
-        paint(
-            DIM,
-            format!(" · last {} · {count}", duration(now.duration_since(since)))
-        )
-    );
+    let rooms = shown.iter().map(|s| s.room);
+    let low = rooms.clone().fold(f64::INFINITY, f64::min);
+    let high = rooms.fold(f64::NEG_INFINITY, f64::max);
+    let range = if shown.is_empty() {
+        String::new()
+    } else if (high - low).abs() < 0.05 {
+        format!(" · room {low:.1} °C")
+    } else {
+        format!(" · room {low:.1} to {high:.1} °C")
+    };
+    let about = format!(" · last {span} · {count}");
+    // The room range goes on a line of its own where one line would wrap.
+    let fits = device.name.chars().count() + about.chars().count() + range.chars().count();
+    let (about, range) = if fits <= columns() {
+        (about + &range, String::new())
+    } else {
+        (about, range.trim_start_matches(" · ").to_owned())
+    };
+    println!("{}{}", paint(BOLD, &device.name), paint(DIM, about));
+    if !range.is_empty() {
+        println!("{}", paint(DIM, range));
+    }
     if shown.is_empty() {
         note("Every read of the unit, by a command or the TUI, adds a sample.");
         return;
     }
-
-    let low = shown.iter().map(|s| s.room).fold(f64::INFINITY, f64::min);
-    let high = shown
-        .iter()
-        .map(|s| s.room)
-        .fold(f64::NEG_INFINITY, f64::max);
-    let room_label = format!("room {low:.1}-{high:.1}°");
-    let labels = room_label.chars().count() + 2;
     let timeline = Timeline {
-        since,
-        now,
-        width: chart_width(labels),
+        width: columns().saturating_sub(HISTORY_LABELS).clamp(10, 160),
+        ..timeline
     };
+    history_chart(timeline, samples, tz);
+    println!();
+    history_changes(timeline, &shown, tz);
+}
+
+/// The room temperature as a sparkline, the modes under it and the time axis.
+fn history_chart(timeline: Timeline, samples: &[Sample], tz: &TimeZone) {
     let columns = timeline.columns(samples);
+    // The bars use their full height for what is drawn.
+    let drawn = columns.iter().flatten().map(|c| c.room);
+    let bottom = drawn.clone().fold(f64::INFINITY, f64::min);
+    let top = drawn.fold(f64::NEG_INFINITY, f64::max);
     let spark: String = columns
         .iter()
         .map(|column| match column {
-            Some(s) => {
-                let share = if high > low {
-                    (s.room - low) / (high - low)
+            Some(c) => {
+                let share = if top > bottom {
+                    (c.room - bottom) / (top - bottom)
                 } else {
                     0.5
                 };
@@ -688,38 +708,55 @@ pub fn history(
             None => " ".to_owned(),
         })
         .collect();
+    // Without colors, letters tell the modes apart.
+    let colored = anstream::AutoStream::choice(&io::stdout()) != anstream::ColorChoice::Never;
     let modes: String = columns
         .iter()
-        .map(|column| match column {
-            Some(s) if s.power => paint(accent(s.mode), "▀"),
-            Some(_) => paint(DIM, "·"),
+        .map(|column| match column.map(|c| c.running) {
+            Some(Some(mode)) if colored => paint(accent(mode), "▀"),
+            Some(Some(mode)) => mode.to_string().chars().next().unwrap_or('?').to_string(),
+            Some(None) => paint(DIM, "·"),
             None => " ".to_owned(),
         })
         .collect();
-    println!("{}{spark}", paint(DIM, format!("{room_label:<labels$}")));
-    println!("{}{modes}", paint(DIM, format!("{:<labels$}", "mode")));
-    println!("{}{}", " ".repeat(labels), paint(DIM, timeline.axis(tz)));
-    println!();
+    println!(
+        "{}{spark}",
+        paint(DIM, format!("{:<HISTORY_LABELS$}", "room"))
+    );
+    println!(
+        "{}{modes}",
+        paint(DIM, format!("{:<HISTORY_LABELS$}", "mode"))
+    );
+    println!(
+        "{}{}",
+        " ".repeat(HISTORY_LABELS),
+        paint(DIM, timeline.axis(tz))
+    );
+}
 
+/// The first state in the window and each change of a setting after it, the latest ones.
+fn history_changes(timeline: Timeline, shown: &[&Sample], tz: &TimeZone) {
+    let Timeline { since, now, .. } = timeline;
     // One time format for the whole table: the clock alone within today, the weekday within a
-    // week, the date beyond.
+    // week, the date beyond, as on the axis.
     let today = now.to_zoned(tz.clone()).date();
     let format = if since.to_zoned(tz.clone()).date() == today {
         "%H:%M"
     } else if now.duration_since(since) < SignedDuration::from_hours(24 * 6) {
         "%a %H:%M"
     } else {
-        "%Y-%m-%d %H:%M"
+        "%b %d %H:%M"
     };
-    // The first state, then each change of what the unit was asked to do.
     let mut rows = Vec::new();
     let mut previous: Option<&Sample> = None;
-    for &sample in &shown {
+    for &sample in shown {
         let changed = previous.is_none_or(|p| {
             p.power != sample.power
                 || p.mode != sample.mode
+                || p.fan != sample.fan
                 || (p.target - sample.target).abs() > 0.01
         });
+        let first = previous.is_none();
         previous = Some(sample);
         if !changed {
             continue;
@@ -730,18 +767,31 @@ pub fn history(
             DIM
         };
         let plain = Style::new();
+        let when = sample.at.to_zoned(tz.clone()).strftime(format).to_string();
         rows.push([
-            (
-                sample.at.to_zoned(tz.clone()).strftime(format).to_string(),
-                plain,
-            ),
+            (when, if first { DIM } else { plain }),
             ((if sample.power { "on" } else { "off" }).to_owned(), plain),
             (sample.mode.to_string(), tone),
             (format!("{:.1} °C", sample.target), plain),
+            (
+                sample.fan.map_or("?".to_owned(), |fan| fan.to_string()),
+                plain,
+            ),
             (format!("{:.1} °C", sample.room), plain),
         ]);
     }
-    table(["CHANGED", "POWER", "MODE", "TARGET", "ROOM"], &rows);
+    let earlier = rows.len().saturating_sub(HISTORY_ROWS);
+    if earlier > 0 {
+        let what = if earlier == 1 { "change" } else { "changes" };
+        note(format!(
+            "{earlier} earlier {what} left out; --json lists every sample"
+        ));
+    }
+    table(
+        ["FROM", "POWER", "MODE", "TARGET", "FAN", "ROOM"],
+        [false, false, false, true, false, true],
+        &rows[earlier..],
+    );
 }
 
 #[derive(Serialize)]

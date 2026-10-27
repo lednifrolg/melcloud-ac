@@ -129,6 +129,8 @@ pub enum FailureKind {
     TooSoon,
     /// Throttling, the hourly budget or a login lockout.
     Blocked,
+    /// MELCloud could not be reached, or failed: network, timeout, HTTP 5xx.
+    Unreachable,
     Other,
 }
 
@@ -255,6 +257,8 @@ pub struct Model {
     pub notice: Option<Entry>,
     pub quit: Quit,
     pub animations: bool,
+    /// The last request failed to reach MELCloud.
+    pub unreachable: bool,
     /// Until when the big digits light up after the target changed.
     pub flash_until: Option<Timestamp>,
     preferred_device: Option<String>,
@@ -413,6 +417,7 @@ impl Model {
             notice: None,
             quit: Quit::No,
             animations: start.animations,
+            unreachable: false,
             flash_until: None,
             preferred_device: start.preferred_device,
             email: start.email,
@@ -479,6 +484,7 @@ impl Model {
             Msg::Key(key) => return self.key(key),
             Msg::Tick(now) => self.now = now,
             Msg::Devices(Ok((devices, state))) => {
+                self.unreachable = false;
                 self.busy = None;
                 self.device = choose(devices.value.devices(), self.preferred_device.as_deref());
                 self.devices = Some(devices);
@@ -494,6 +500,7 @@ impl Model {
                 manual,
             } => {
                 self.busy = None;
+                self.unreachable = false;
                 self.adopt(state);
                 self.log(
                     Tone::Good,
@@ -509,6 +516,7 @@ impl Model {
                 self.failed(failure);
             }
             Msg::LoggedIn(Ok(account)) => {
+                self.unreachable = false;
                 self.busy = None;
                 self.overlay = Overlay::None;
                 self.log(Tone::Good, format!("logged in as {}", account.email));
@@ -561,6 +569,7 @@ impl Model {
     fn sent(&mut self, result: Result<(), Failure>) {
         match result {
             Ok(()) => {
+                self.unreachable = false;
                 if let Some(flight) = &mut self.flight {
                     flight.phase = Phase::Confirming;
                 }
@@ -680,12 +689,17 @@ impl Model {
             }
             FailureKind::TooSoon => {}
             FailureKind::Blocked => self.next_refresh = Some(self.now + self.refresh_every),
-            FailureKind::Other => self.next_refresh = Some(self.now + RETRY_AFTER_FAILURE),
+            FailureKind::Unreachable | FailureKind::Other => {
+                self.next_refresh = Some(self.now + RETRY_AFTER_FAILURE);
+            }
+        }
+        if failure.kind == FailureKind::Unreachable {
+            self.unreachable = true;
         }
         let tone = match failure.kind {
             FailureKind::TooSoon => Tone::Info,
             FailureKind::NeedsLogin => Tone::Warn,
-            FailureKind::Blocked | FailureKind::Other => Tone::Bad,
+            FailureKind::Blocked | FailureKind::Unreachable | FailureKind::Other => Tone::Bad,
         };
         self.log(tone, failure.message);
     }
