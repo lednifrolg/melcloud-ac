@@ -62,12 +62,12 @@ type klima
 ```
 
 The last line should say `klima is` followed by the path in `~/.local/bin`. If klima is not
-found, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` or `~/.bashrc` and open a new
-terminal. If it names another file, an older klima comes first on PATH; remove it, with
-`cargo uninstall klima` for one built from source. The same commands update klima. Other
-systems, like a 32-bit Raspberry Pi, build from source (below). The archive also holds shell
-completions in `completions/` and man pages in `man/man1/`, the same files `klima completions`
-and `klima man` write (see [Usage](#usage)).
+found, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc`, or for bash to `~/.bashrc`
+(`~/.bash_profile` on macOS), and open a new terminal. If it names another file, an older klima
+comes first on PATH; remove it, with `cargo uninstall klima` for one built from source. The same
+commands update klima. Other systems, like a 32-bit Raspberry Pi, build from source (below). The
+archive also holds shell completions in `completions/` and man pages in `man/man1/`, the same
+files `klima completions` and `klima man` write (see [Usage](#usage)).
 
 The installed binary is attested as well, so it can be checked later from any terminal,
 without running it:
