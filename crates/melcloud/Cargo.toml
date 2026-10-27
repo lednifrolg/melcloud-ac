@@ -1,0 +1,14 @@
+[package]
+name = "melcloud"
+description = "Client for the classic MELCloud API used by Mitsubishi Electric air conditioners"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

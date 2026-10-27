@@ -8,17 +8,14 @@ and controls a real device on a real account.
 
 ## Status
 
-Design phase. The API has been verified live for login, device listing, reading unit state and
-changing the target temperature. No CLI yet.
+Early development: the workspace and CI are set up, the `klima` CLI does not do anything yet.
+The API has been verified live for login, device listing, reading unit state and changing the
+target temperature.
 
-## Credentials
+## Login
 
-The client will read `~/.config/melcloud/credentials.json`, kept outside the repository and
-readable only by the owner (`chmod 600`):
-
-```json
-{"email": "user@example.com", "password": "..."}
-```
+`klima login` asks for your email and password. The password is never stored; only the session
+token is kept locally, readable only by you. When the session expires, log in again.
 
 ## Using the API responsibly
 
@@ -27,3 +24,24 @@ readable only by the owner (`chmod 600`):
 - Stop on HTTP 429. Throttling applies to the whole account and lasts for hours.
 - Read state sparingly (at most once every few minutes); one check after a command is enough.
 - Never log or commit the session key (`ContextKey`), password, MAC address or serial number.
+
+## Development
+
+| Crate | Purpose |
+|---|---|
+| `crates/melcloud` | MELCloud API client, no UI dependencies |
+| `crates/klima` | the `klima` binary: CLI and TUI |
+
+The checks CI runs:
+
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
+cargo deny check
+```
+
+## License
+
+Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
+[MIT license](LICENSE-MIT) at your option.

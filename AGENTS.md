@@ -10,6 +10,17 @@ It holds the API contract (`research/api.md`), live verification log
 (`research/live-verification.md`), app analysis, one-off scripts and captured server responses
 (`research/fixtures/`). Read `research/api.md` before changing API code, and update it and
 `research/live-verification.md` when API behavior changes or something new is verified.
+The agreed product and technical design (milestones, decisions, keymap) is in
+`.lavish/klima-design.html`, also local only.
+
+## Code
+
+- `crates/melcloud` must stay free of UI and terminal dependencies; the CLI and TUI live in
+  `crates/klima`.
+- Before committing, run the checks listed in README "Development"; CI runs the same ones.
+- Synthetic test data is in `crates/melcloud/tests/data`. When a captured response is available
+  locally, `tests/synthetic_data.rs` fails if the synthetic data uses a field or JSON type the
+  server does not send; keep it passing when adding data.
 
 ## Working with the live API
 
@@ -17,8 +28,9 @@ It holds the API contract (`research/api.md`), live verification log
   consent before sending any command (`Device/Set*`, `Group/Set*`, anything but reads).
 - Never retry login in a loop. Stop immediately on HTTP 429.
 - Do not poll more often than once every few minutes.
-- Credentials live in `~/.config/melcloud/credentials.json` (mode 600). Never print them, and
-  never log `ContextKey`, password, MAC address or serial number.
+- Credentials for live checks with the research scripts live in
+  `~/.config/melcloud/credentials.json` (mode 600). The app itself never stores the password.
+  Never print credentials, and never log `ContextKey`, password, MAC address or serial number.
 
 ## Repository
 
