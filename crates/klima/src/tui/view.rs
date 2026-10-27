@@ -651,7 +651,8 @@ fn outside(model: &Model, frame: &mut Frame, area: Rect) {
 }
 
 /// The weather at the building, `width` columns wide: the forecast, then sunrise and sunset.
-/// The humidity goes where the conditions leave no room for it.
+/// The humidity goes where the conditions leave no room for it, and conditions too long even
+/// without it are shortened.
 fn outside_lines(model: &Model, width: usize) -> Vec<Line<'static>> {
     let weather = model
         .state
@@ -659,19 +660,26 @@ fn outside_lines(model: &Model, width: usize) -> Vec<Line<'static>> {
         .map(|s| s.value.view().weather.as_slice())
         .unwrap_or_default();
     let today = model.now.to_zoned(model.tz.clone()).date();
+    // The label, the temperature and the gap before the conditions.
+    let lead = 11 + 4 + 2;
     let conditions = weather
         .iter()
         .map(|w| condition(&w.condition).chars().count())
         .max()
-        .unwrap_or(0);
-    let humidity = 11 + 4 + 2 + conditions + 5 <= width;
+        .unwrap_or(0)
+        .min(width.saturating_sub(lead).max(1));
+    let humidity = lead + conditions + 5 <= width;
     let mut lines: Vec<Line> = weather
         .iter()
         .map(|w| {
             let mut spans = vec![
                 Span::styled(format!("{:<11}", weather_label(w.kind, w.time, today)), DIM),
                 Span::styled(format!("{:>3.0}°", w.temperature), BOLD),
-                format!("  {:<conditions$}", condition(&w.condition)).into(),
+                format!(
+                    "  {:<conditions$}",
+                    shorten(&condition(&w.condition), conditions)
+                )
+                .into(),
             ];
             if humidity {
                 spans.push(Span::styled(format!(" {:>3.0}%", w.humidity), DIM));
@@ -1248,8 +1256,11 @@ fn help(frame: &mut Frame, area: Rect) {
         .collect();
     lines.push(Line::default());
     lines.push(Line::styled("? or Esc closes this help", DIM));
+    // As wide as its widest line, with the borders and the padding.
+    let width = lines.iter().map(Line::width).max().unwrap_or(0) + 4;
+    let width = u16::try_from(width).unwrap_or(u16::MAX);
     let height = u16::try_from(lines.len()).unwrap_or(u16::MAX) + 2;
-    let popup = centered(area, 60.min(area.width), height.min(area.height));
+    let popup = centered(area, width.min(area.width), height.min(area.height));
     frame.render_widget(Clear, popup);
     frame.render_widget(
         Paragraph::new(lines).block(pane(title("Keys"), OVERLAY)),
@@ -1398,6 +1409,41 @@ mod tests {
         let mut model = lived_in();
         model.overlay = Overlay::Help;
         insta::assert_snapshot!(screen(&model, 120, 30));
+    }
+
+    #[test]
+    fn help_fits_the_narrowest_window() {
+        // The popup's borders and padding, and the keys before each text.
+        let room = usize::from(TABS_MIN.0) - 4 - 8;
+        for binding in BINDINGS {
+            assert!(
+                binding.help.chars().count() <= room,
+                "help for {} is wider than {room}: {}",
+                binding.keys,
+                binding.help
+            );
+        }
+    }
+
+    #[test]
+    fn long_weather_conditions_are_shortened() {
+        let mut model = lived_in();
+        let cached = model.state.as_mut().unwrap();
+        let mut raw = cached.value.raw().clone();
+        for observation in raw["WeatherObservations"].as_array_mut().unwrap() {
+            observation["ConditionName"] = "Moderate or heavy rain shower".into();
+        }
+        cached.value = serde_json::from_value(serde_json::Value::Object(raw)).unwrap();
+        for width in 29..=60 {
+            for line in outside_lines(&model, width) {
+                assert!(line.width() <= width, "{line} is wider than {width}");
+            }
+        }
+        // The outside pane of the narrowest wide layout.
+        assert_eq!(
+            outside_lines(&model, 32)[0].to_string(),
+            "now          2°  moderate or he…"
+        );
     }
 
     #[test]

@@ -42,7 +42,7 @@ Sleep 1.2s
 Enter
 Sleep 4s
 Type "?"
-Sleep 2.5s
+Sleep 4s
 Type "?"
 Sleep 500ms
 Type "q"

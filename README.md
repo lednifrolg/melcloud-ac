@@ -6,7 +6,7 @@ Terminal client for Mitsubishi Electric air conditioners on the classic MELCloud
 Unofficial project, not affiliated with Mitsubishi Electric. It talks to an undocumented API
 and controls a real device on a real account.
 
-![klima status in the shell; then the TUI raising the target and the fan speed, each confirmed by the unit, and its help; then klima history](assets/demo.gif)
+![The TUI raising the target and the fan speed, each confirmed by the unit, and its help; then the shell with klima status and klima history](assets/demo.gif)
 
 ## Status
 
@@ -249,7 +249,7 @@ windowrule = match:class ^klima$, float on, center on, size 1100 720
 ```
 
 To see what a binding did, make it send the first line of klima's answer as a notification. In
-place of the A binding above, in Lua:
+place of the A binding above, in Lua (on Omarchy, with `o.bind` in place of `klima`):
 
 ```lua
 klima("SUPER + CTRL + ALT + A", "Air conditioner on or off",

@@ -12,7 +12,8 @@
 //! command a moment after it arrives, as an adapter would, and fills the history of a new home
 //! directory with a day of samples.
 
-use std::path::{Path, PathBuf};
+use std::io::Write;
+use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -30,17 +31,22 @@ const DEVICE_ID: i64 = 1_000_001;
 /// How long the simulated adapter takes to pick a command up.
 const ADAPTER_DELAY: Duration = Duration::from_millis(1500);
 
+const USAGE: &str = "usage: demo_server <port> [<new home directory>]";
+
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
     let Some(port) = args.next().and_then(|p| p.parse::<u16>().ok()) else {
-        fail("usage: demo_server <port> [<new home directory>]");
+        fail(USAGE);
     };
     let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) else {
         fail(&format!("port {port} is taken"));
     };
-    if let Some(home) = args.next().map(PathBuf::from) {
-        prepare(&home);
+    match args.next() {
+        // An unset variable, as in `"$KLIMA_HOME"`, would make it the current directory.
+        Some(home) if home.is_empty() => fail(USAGE),
+        Some(home) => prepare(Path::new(&home)),
+        None => {}
     }
     let server = MockServer::builder().listener(listener).start().await;
 
@@ -194,23 +200,26 @@ impl Respond for TakeCommand {
 /// Writes a configuration and a day of history into `home`: off at night, heating in the
 /// morning and in the evening, and for the last two hours whatever the time.
 fn prepare(home: &Path) {
-    let config = home.join("config");
-    let state = home.join("state");
-    // Never a real klima home: only a new or empty directory.
-    if std::fs::read_dir(home).is_ok_and(|mut entries| entries.next().is_some()) {
+    // Never a real klima home: only a new or empty directory, and no file in it is replaced.
+    let usable = match std::fs::read_dir(home) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    };
+    if !usable {
         fail(&format!(
-            "{} is not empty; give a new, empty directory",
+            "{} is not a new or empty directory; give one",
             home.display()
         ));
     }
+    let config = home.join("config");
+    let state = home.join("state");
     for dir in [&config, &state] {
-        std::fs::create_dir_all(dir).expect("the demo home can be written");
+        std::fs::create_dir_all(dir).unwrap_or_else(|error| cannot_write(dir, &error));
     }
-    std::fs::write(
-        config.join("config.toml"),
+    write_new(
+        &config.join("config.toml"),
         "email = \"user@example.com\"\ndevice = \"Living room\"\n",
-    )
-    .expect("the demo home can be written");
+    );
 
     let now = Timestamp::now();
     let zone = TimeZone::system();
@@ -244,6 +253,19 @@ fn prepare(home: &Path) {
             .to_string(),
         );
     }
-    std::fs::write(state.join("history.jsonl"), lines.join("\n") + "\n")
-        .expect("the demo home can be written");
+    write_new(&state.join("history.jsonl"), &(lines.join("\n") + "\n"));
+}
+
+/// Writes a file that must not exist yet.
+fn write_new(file: &Path, contents: &str) {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(file)
+        .and_then(|mut file| file.write_all(contents.as_bytes()))
+        .unwrap_or_else(|error| cannot_write(file, &error));
+}
+
+fn cannot_write(path: &Path, error: &std::io::Error) -> ! {
+    fail(&format!("cannot write {}: {error}", path.display()))
 }
