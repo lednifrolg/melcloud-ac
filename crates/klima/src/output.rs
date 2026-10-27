@@ -9,12 +9,14 @@ use anstyle::{Ansi256Color, AnsiColor, Style};
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use melcloud::{
-    AtaState, Capabilities, Device, DeviceId, DeviceKind, EffectiveFlags, FanSpeed, OperationMode,
-    WeatherKind,
+    AtaState, AtaView, Capabilities, Device, DeviceId, DeviceKind, EffectiveFlags, FanSpeed,
+    OperationMode, WeatherKind,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::cache::Sample;
+use crate::chart::{Column, GAP, Timeline, cell};
 use crate::error::AppError;
 use crate::theme;
 
@@ -24,6 +26,8 @@ const GREEN: Style = AnsiColor::Green.on_default();
 const YELLOW: Style = AnsiColor::Yellow.on_default();
 const RED: Style = AnsiColor::Red.on_default();
 const CYAN: Style = AnsiColor::Cyan.on_default();
+/// The room temperature in history charts, as in the TUI.
+const ROOM: Style = AnsiColor::Blue.on_default();
 
 /// The color that stands for a mode, as in the TUI.
 fn accent(mode: OperationMode) -> Style {
@@ -78,8 +82,24 @@ pub fn duration(span: SignedDuration) -> String {
     }
 }
 
-/// The error with the causes that add something, in one line.
+/// The error with the causes that add something, in one line. A connection failure is named by
+/// its cause alone, without the request's URL: "could not reach MELCloud: connection refused".
 pub fn message(error: &AppError) -> String {
+    if let AppError::Api(melcloud::Error::Transport(e)) = error {
+        let mut cause: &dyn std::error::Error = e;
+        while let Some(inner) = cause.source() {
+            cause = inner;
+        }
+        let text = cause.to_string();
+        let text = text.split(" (os error").next().unwrap_or_default();
+        let mut chars = text.chars();
+        let first = chars.next().map(|c| c.to_lowercase().collect::<String>());
+        return format!(
+            "could not reach MELCloud: {}{}",
+            first.unwrap_or_default(),
+            chars.as_str()
+        );
+    }
     let mut message = error.to_string();
     let mut cause = error.source();
     while let Some(inner) = cause {
@@ -104,11 +124,35 @@ pub fn success(text: impl std::fmt::Display) {
     println!("{} {text}", paint(GREEN, "✓"));
 }
 
+/// Writes `bytes` to standard output as they are. A reader that stops early, like `head`, is
+/// not an error.
+pub fn raw(bytes: &[u8]) -> Result<(), AppError> {
+    let mut stdout = io::stdout().lock();
+    match stdout.write_all(bytes).and_then(|()| stdout.flush()) {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(AppError::io("standard output", e)),
+        _ => Ok(()),
+    }
+}
+
 pub fn json(value: &impl Serialize) {
-    println!(
-        "{}",
-        serde_json::to_string_pretty(value).expect("output is plain data")
-    );
+    let text = serde_json::to_string_pretty(value).expect("output is plain data");
+    println!("{}", terminal_safe_json(&text));
+}
+
+/// JSON escapes the ASCII control characters but leaves DEL, C1 controls and direction overrides
+/// as they are; written as escapes they mean the same to a parser and nothing to a terminal.
+fn terminal_safe_json(text: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut safe = String::with_capacity(text.len());
+    for c in text.chars() {
+        if (!c.is_ascii_control() && melcloud::unsafe_to_show(c)) || c == '\u{7f}' {
+            let _ = write!(safe, "\\u{:04x}", u32::from(c));
+        } else {
+            safe.push(c);
+        }
+    }
+    safe
 }
 
 fn fan_bars(fan: FanSpeed, levels: u8, style: Style) -> String {
@@ -137,11 +181,10 @@ pub struct StatusReport<'a> {
     pub stale_because: Option<String>,
 }
 
-pub fn status(report: &StatusReport, caps: &Capabilities) {
-    let view = report.state.view();
-    let tone = if view.power { accent(view.mode) } else { DIM };
-    let model = report
-        .device
+/// Name and model, then whether the unit runs and in which mode; on two lines where one would
+/// wrap.
+fn status_heading(device: &Device, view: &AtaView, tone: Style) {
+    let model = device
         .model
         .as_deref()
         .map(|m| format!(" · {m}"))
@@ -151,13 +194,23 @@ pub fn status(report: &StatusReport, caps: &Capabilities) {
     } else {
         paint(DIM, "○ off")
     };
-    println!(
-        "{}{}   {power} {} {}",
-        paint(BOLD, &report.device.name),
-        paint(DIM, model),
+    let state = format!(
+        "{power} {} {}",
         paint(DIM, "·"),
         paint(tone.bold(), view.mode)
     );
+    let width = columns();
+    let name = shorten(&device.name, width.saturating_sub(model.chars().count()));
+    let state_width = if view.power { 4 } else { 5 } + 3 + view.mode.to_string().len();
+    let one_line = name.chars().count() + model.chars().count() + 3 + state_width <= width;
+    let gap = if one_line { "   " } else { "\n" };
+    println!("{}{}{gap}{state}", paint(BOLD, name), paint(DIM, model));
+}
+
+pub fn status(report: &StatusReport, caps: &Capabilities) {
+    let view = report.state.view();
+    let tone = if view.power { accent(view.mode) } else { DIM };
+    status_heading(report.device, view, tone);
 
     let outside = view
         .weather
@@ -324,27 +377,45 @@ pub fn devices(devices: &[Device], fetched_at: Timestamp) {
             ]
         })
         .collect();
-    let width = |column: usize| {
+    // Where the table is wider than the terminal, the building gets shorter, then goes, then the
+    // name gets shorter.
+    let mut widths: [usize; 5] = std::array::from_fn(|column| {
         rows.iter()
             .map(|row| row[column].chars().count())
             .chain([header[column].len()])
             .max()
             .unwrap_or(0)
+    });
+    let mut over = (widths.iter().sum::<usize>() + 2 * 4).saturating_sub(columns());
+    let shrink = |widths: &mut [usize; 5], column: usize, over: &mut usize| {
+        let cut = (*over).min(widths[column].saturating_sub(header[column].len().max(8)));
+        widths[column] -= cut;
+        *over -= cut;
     };
-    let widths: Vec<usize> = (0..header.len()).map(width).collect();
-    let line = |cells: &[&str]| {
-        cells
-            .iter()
-            .zip(&widths)
-            .map(|(cell, &w)| format!("{cell:<w$}"))
-            .collect::<Vec<_>>()
-            .join("  ")
-            .trim_end()
-            .to_owned()
+    shrink(&mut widths, 4, &mut over);
+    let building = over == 0;
+    if !building {
+        over = over.saturating_sub(widths[4] + 2);
+    }
+    shrink(&mut widths, 0, &mut over);
+    let cells = |row: [String; 5]| {
+        let mut column = 0;
+        row.map(|cell| {
+            let cell = shorten(&cell, widths[column]);
+            column += 1;
+            (cell, Style::new())
+        })
     };
-    println!("{}", paint(DIM, line(&header)));
-    for row in &rows {
-        println!("{}", line(&row.each_ref().map(String::as_str)));
+    let rows: Vec<[(String, Style); 5]> = rows.into_iter().map(cells).collect();
+    if building {
+        table(header, [false; 5], &rows);
+    } else {
+        let [name, model, access, id, _] = header;
+        let rows: Vec<[(String, Style); 4]> = rows
+            .into_iter()
+            .map(|[name, model, access, id, _]| [name, model, access, id])
+            .collect();
+        table([name, model, access, id], [false; 4], &rows);
     }
     println!(
         "{}",
@@ -353,6 +424,44 @@ pub fn devices(devices: &[Device], fetched_at: Timestamp) {
             format!("updated {}", ago(fetched_at, Timestamp::now()))
         )
     );
+}
+
+/// A table with a dim header and columns as wide as their widest cell; `right` aligns numbers.
+fn table<const N: usize>(header: [&str; N], right: [bool; N], rows: &[[(String, Style); N]]) {
+    let widths: [usize; N] = std::array::from_fn(|column| {
+        rows.iter()
+            .map(|row| row[column].0.chars().count())
+            .chain([header[column].len()])
+            .max()
+            .unwrap_or(0)
+    });
+    // Padding goes inside the color, and the last column gets none.
+    let line = |cells: [(&str, Style); N]| {
+        cells
+            .into_iter()
+            .zip(widths)
+            .enumerate()
+            .map(|(column, ((text, style), width))| {
+                if right[column] {
+                    paint(style, format!("{text:>width$}"))
+                } else if column + 1 == N {
+                    paint(style, text)
+                } else {
+                    paint(style, format!("{text:<width$}"))
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_owned()
+    };
+    println!("{}", line(header.map(|text| (text, DIM))));
+    for row in rows {
+        println!(
+            "{}",
+            line(row.each_ref().map(|(text, style)| (text.as_str(), *style)))
+        );
+    }
 }
 
 #[derive(Serialize)]
@@ -559,6 +668,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn json_escapes_what_a_terminal_would_act_on() {
+        let value = serde_json::json!({"name": "a\u{1b}b\u{9b}c\u{202e}d\u{7f}é\n"});
+        let text = terminal_safe_json(&serde_json::to_string(&value).unwrap());
+        assert_eq!(text, r#"{"name":"a\u001bb\u009bc\u202ed\u007fé\n"}"#);
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, value, "the same to a parser");
+    }
+
+    #[test]
     fn ages_read_naturally() {
         let now = Timestamp::from_second(1_800_000_000).unwrap();
         let before = |seconds: i64| now - SignedDuration::from_secs(seconds);
@@ -591,4 +709,269 @@ mod tests {
         assert_eq!(glyphs, "▁▂▄▆█");
         assert_eq!(fan_bars(FanSpeed::Auto, 4, BOLD).matches(&dim).count(), 0);
     }
+}
+
+/// Width of the terminal, or 80 columns when the output is not a terminal, so piped output does
+/// not depend on the window.
+fn columns() -> usize {
+    if io::stdout().is_terminal() {
+        ratatui::crossterm::terminal::size().map_or(80, |(width, _)| usize::from(width))
+    } else {
+        80
+    }
+}
+
+/// Rows of the change table in `klima history`; `--json` has every sample.
+const HISTORY_ROWS: usize = 20;
+/// Width of the labels before the chart in `klima history`.
+const HISTORY_LABELS: usize = 5;
+/// The smallest temperature range the sparkline spreads over its height, in °C, so a tenth of a
+/// degree does not look like a jump.
+const SPARK_RANGE: f64 = 1.0;
+
+/// `text` cut to `width` characters, ending in "…" where it was cut.
+pub fn shorten(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        text.to_owned()
+    } else {
+        let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+        kept + "…"
+    }
+}
+
+/// `parts` joined by " · " on lines no wider than `width`, wrapping only between parts. The
+/// first part, in bold, is shortened with "…" when it alone is too wide.
+fn header(parts: &[String], width: usize) {
+    let mut lines: Vec<String> = Vec::new();
+    for (index, part) in parts.iter().enumerate() {
+        let shown = if index == 0 {
+            paint(BOLD, shorten(part, width))
+        } else {
+            paint(DIM, part)
+        };
+        let length = |line: &str| {
+            anstream::adapter::strip_str(line)
+                .to_string()
+                .chars()
+                .count()
+        };
+        match lines.last_mut() {
+            Some(line) if length(line) + 3 + part.chars().count() <= width => {
+                line.push_str(&paint(DIM, " · "));
+                line.push_str(&shown);
+            }
+            _ => lines.push(shown),
+        }
+    }
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+/// `klima history`: the room temperature as a sparkline with the modes under it, and a table of
+/// the changes of the settings. `samples` may start before `since`: the one standing when the
+/// window opens is part of the picture. `span` describes the window.
+pub fn history(device: &Device, span: &str, timeline: Timeline, samples: &[Sample], tz: &TimeZone) {
+    let width = columns();
+    let timeline = Timeline {
+        width: width.saturating_sub(HISTORY_LABELS).clamp(10, 160),
+        ..timeline
+    };
+    let Timeline { since, now, .. } = timeline;
+    // Samples after now were stamped by a clock that ran ahead; they are left out.
+    let samples = &samples[..samples.partition_point(|s| s.at <= now)];
+    let shown = samples.iter().filter(|s| s.at >= since).count();
+    let count = match shown {
+        1 => "1 sample".to_owned(),
+        n => format!("{n} samples"),
+    };
+    let columns = timeline.columns(samples);
+    // The range of the readings themselves, with the one standing when the window opens.
+    let standing = samples.partition_point(|s| s.at < since).saturating_sub(1);
+    let rooms = samples[standing..]
+        .iter()
+        .filter(|s| s.at >= since || since.duration_since(s.at) <= GAP)
+        .map(|s| s.room);
+    let low = rooms.clone().fold(f64::INFINITY, f64::min);
+    let high = rooms.fold(f64::NEG_INFINITY, f64::max);
+    let mut parts = vec![device.name.clone(), format!("last {span}"), count];
+    if shown > 0 {
+        parts.push(if high - low < 0.05 {
+            format!("room {low:.1} °C")
+        } else {
+            format!("room {low:.1} to {high:.1} °C")
+        });
+    }
+    header(&parts, width);
+    if shown == 0 {
+        let latest = samples.iter().rev().find(|s| s.at < since);
+        match latest {
+            Some(latest) => note(format!(
+                "No reads in the last {span}; the latest was {}.",
+                ago(latest.at, now)
+            )),
+            None => note("Every read of the unit, by a command or the TUI, adds a sample."),
+        }
+        return;
+    }
+    history_chart(timeline, &columns, (low, high), tz);
+    println!();
+    let levels = device.capabilities.as_ref().map_or(0, |c| c.fan_levels);
+    history_changes(timeline, samples, levels, tz);
+}
+
+/// The room temperature as a sparkline between `low` and `high`, the modes under it, the time
+/// axis and a legend of the modes shown.
+fn history_chart(
+    timeline: Timeline,
+    columns: &[Option<Column>],
+    (low, high): (f64, f64),
+    tz: &TimeZone,
+) {
+    let middle = f64::midpoint(low, high);
+    let half = ((high - low) / 2.0).max(SPARK_RANGE / 2.0);
+    let spark: String = columns
+        .iter()
+        .map(|column| match column {
+            Some(c) => {
+                let share = (c.room - (middle - half)) / (2.0 * half);
+                paint(ROOM, theme::BARS[cell(share, theme::BARS.len() - 1)])
+            }
+            None => " ".to_owned(),
+        })
+        .collect();
+    // Without colors, letters tell the modes apart.
+    let colored = anstream::AutoStream::choice(&io::stdout()) != anstream::ColorChoice::Never;
+    let mark = |mode: OperationMode| {
+        if colored {
+            paint(accent(mode), "▀")
+        } else {
+            mode.to_string().chars().next().unwrap_or('?').to_string()
+        }
+    };
+    let modes: String = columns
+        .iter()
+        .map(|column| match column.map(|c| c.running) {
+            Some(Some(mode)) => mark(mode),
+            Some(None) => paint(DIM, "·"),
+            None => " ".to_owned(),
+        })
+        .collect();
+    let mut legend: Vec<String> = Vec::new();
+    for mode in OperationMode::KNOWN {
+        if columns.iter().flatten().any(|c| c.running == Some(mode)) {
+            legend.push(format!("{} {}", mark(mode), paint(DIM, mode)));
+        }
+    }
+    if columns.iter().flatten().any(|c| c.running.is_none()) {
+        legend.push(paint(DIM, "· off"));
+    }
+    if columns.iter().any(Option::is_none) {
+        legend.push(paint(DIM, "blank: not read"));
+    }
+    let labels = |text: &str| paint(DIM, format!("{text:<HISTORY_LABELS$}"));
+    println!("{}{spark}", labels("room"));
+    println!("{}{modes}", labels("mode"));
+    println!("{}{}", labels(""), paint(DIM, timeline.axis(tz)));
+    println!("{}{}", labels(""), legend.join("  "));
+}
+
+/// The state when the window opens, then each change of a setting, the latest ones.
+fn history_changes(timeline: Timeline, samples: &[Sample], levels: u8, tz: &TimeZone) {
+    let Timeline { since, .. } = timeline;
+    let format = timeline.dates(tz).time();
+    let time = |at: Timestamp| at.to_zoned(tz.clone()).strftime(format).to_string();
+    // The sample standing when the window opens is shown at the start of the window.
+    let standing = samples
+        .iter()
+        .rev()
+        .find(|s| s.at < since)
+        .filter(|s| since.duration_since(s.at) <= GAP);
+    let first = standing.map(|s| (since, s));
+    let inside = samples.iter().filter(|s| s.at >= since).map(|s| (s.at, s));
+    let mut rows = Vec::new();
+    let mut previous: Option<&Sample> = None;
+    for (at, sample) in first.into_iter().chain(inside) {
+        let changed = previous.is_none_or(|p| {
+            p.power != sample.power
+                || p.mode != sample.mode
+                || p.fan != sample.fan
+                || (p.target - sample.target).abs() > 0.01
+        });
+        let opening = previous.is_none();
+        previous = Some(sample);
+        if !changed {
+            continue;
+        }
+        let tone = if sample.power {
+            accent(sample.mode)
+        } else {
+            DIM
+        };
+        let plain = Style::new();
+        let fan = match sample.fan {
+            Some(FanSpeed::Level(level)) if levels > 0 => format!("{level}/{levels}"),
+            Some(fan) => fan.to_string(),
+            None => "?".to_owned(),
+        };
+        rows.push([
+            (time(at), if opening { DIM } else { plain }),
+            ((if sample.power { "on" } else { "off" }).to_owned(), plain),
+            (sample.mode.to_string(), tone),
+            (format!("{:.1}°", sample.target), plain),
+            (fan, plain),
+            (format!("{:.1}°", sample.room), plain),
+        ]);
+    }
+    let earlier = rows.len().saturating_sub(HISTORY_ROWS);
+    if earlier > 0 {
+        let what = if earlier == 1 { "change" } else { "changes" };
+        note(format!("{earlier} earlier {what} hidden; --json has all"));
+    }
+    table(
+        ["FROM", "POWER", "MODE", "TARGET", "FAN", "ROOM"],
+        [false, false, false, true, false, true],
+        &rows[earlier..],
+    );
+}
+
+#[derive(Serialize)]
+struct HistoryJson<'a> {
+    device: DeviceRef<'a>,
+    since: Timestamp,
+    samples: Vec<SampleJson>,
+}
+
+#[derive(Serialize)]
+struct SampleJson {
+    at: Timestamp,
+    power: bool,
+    mode: String,
+    target_temperature: f64,
+    room_temperature: f64,
+    outside_temperature: Option<f64>,
+    fan_speed: Option<String>,
+}
+
+pub fn history_json(device: &Device, since: Timestamp, samples: &[Sample]) {
+    json(&HistoryJson {
+        device: DeviceRef {
+            id: device.id,
+            name: &device.name,
+        },
+        since,
+        samples: samples
+            .iter()
+            .filter(|s| s.at >= since)
+            .map(|s| SampleJson {
+                at: s.at,
+                power: s.power,
+                mode: s.mode.to_string(),
+                target_temperature: s.target,
+                room_temperature: s.room,
+                outside_temperature: s.outside,
+                fan_speed: s.fan.map(|fan| fan.to_string()),
+            })
+            .collect(),
+    });
 }

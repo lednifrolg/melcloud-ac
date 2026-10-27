@@ -137,6 +137,11 @@ pub enum FailureKind {
 pub struct Failure {
     pub kind: FailureKind,
     pub message: String,
+    /// When asking again makes sense, as far as the request budget knows.
+    pub retry_at: Option<Timestamp>,
+    /// Whether MELCloud answered: `Some(false)` when it could not be reached or failed (network,
+    /// timeout, HTTP 5xx), `None` when no request went out.
+    pub reached: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -220,6 +225,8 @@ pub struct Start {
     pub email: Option<String>,
     /// Spinning fan, swinging vanes and flashing digits.
     pub animations: bool,
+    /// Whether the terminal shows colors; without them, marks and letters tell things apart.
+    pub colors: bool,
 }
 
 /// How far quitting has got.
@@ -255,6 +262,15 @@ pub struct Model {
     pub notice: Option<Entry>,
     pub quit: Quit,
     pub animations: bool,
+    pub colors: bool,
+    /// The last request failed to reach MELCloud.
+    pub unreachable: bool,
+    /// When to try loading the device list again after it failed.
+    devices_retry: Option<Timestamp>,
+    /// Failures in a row, which space the retries further apart.
+    failures_in_row: u32,
+    /// Until when the request budget, throttling or a login lockout holds requests back.
+    pub paused_until: Option<Timestamp>,
     /// Until when the big digits light up after the target changed.
     pub flash_until: Option<Timestamp>,
     preferred_device: Option<String>,
@@ -413,6 +429,11 @@ impl Model {
             notice: None,
             quit: Quit::No,
             animations: start.animations,
+            colors: start.colors,
+            unreachable: false,
+            devices_retry: None,
+            failures_in_row: 0,
+            paused_until: None,
             flash_until: None,
             preferred_device: start.preferred_device,
             email: start.email,
@@ -494,14 +515,21 @@ impl Model {
                 manual,
             } => {
                 self.busy = None;
+                self.answered();
                 self.adopt(state);
                 self.log(
                     Tone::Good,
                     if manual { "refreshed" } else { "auto refresh" },
                 );
             }
-            Msg::Devices(Err(failure))
-            | Msg::State {
+            Msg::Devices(Err(failure)) => {
+                self.busy = None;
+                // A login comes first; otherwise the list is asked for again once the retry is
+                // due.
+                self.devices_retry = self.retry_after(&failure);
+                self.failed_with(failure, false);
+            }
+            Msg::State {
                 result: Err(failure),
                 ..
             } => {
@@ -509,6 +537,8 @@ impl Model {
                 self.failed(failure);
             }
             Msg::LoggedIn(Ok(account)) => {
+                self.answered();
+                self.devices_retry = None;
                 self.busy = None;
                 self.overlay = Overlay::None;
                 self.log(Tone::Good, format!("logged in as {}", account.email));
@@ -520,6 +550,7 @@ impl Model {
             }
             Msg::LoggedIn(Err(failure)) => {
                 self.busy = None;
+                self.heard(&failure);
                 if let Overlay::Login(form) = &mut self.overlay {
                     form.error = Some(failure.message);
                     form.password.clear();
@@ -537,6 +568,8 @@ impl Model {
                         .as_ref()
                         .map(|old| differences(old.value.view(), state.value.view()));
                     self.adopt(state);
+                    // Another klima reached MELCloud.
+                    self.answered();
                     if let Some(changes) = changes.filter(|c| !c.is_empty()) {
                         self.log(Tone::Info, format!("another klima: {}", changes.join(", ")));
                     }
@@ -561,6 +594,7 @@ impl Model {
     fn sent(&mut self, result: Result<(), Failure>) {
         match result {
             Ok(()) => {
+                self.answered();
                 if let Some(flight) = &mut self.flight {
                     flight.phase = Phase::Confirming;
                 }
@@ -587,6 +621,7 @@ impl Model {
         }
         match result {
             Ok(delay) => {
+                self.answered();
                 let text = delay.map_or_else(
                     || "applied".to_owned(),
                     |d| {
@@ -601,6 +636,7 @@ impl Model {
                 self.log(Tone::Good, format!("applied: {what}"));
             }
             Err(failure) => {
+                self.heard(&failure);
                 self.notify(Tone::Bad, failure.message.clone());
                 self.log(Tone::Bad, failure.message);
             }
@@ -644,6 +680,10 @@ impl Model {
             return Vec::new();
         }
         if self.devices.is_none() {
+            // After a failure, only once the retry is due: never in a loop.
+            if self.devices_retry.is_some_and(|at| at > self.now) {
+                return Vec::new();
+            }
             self.busy = Some(Busy::Devices);
             return vec![Effect::LoadDevices];
         }
@@ -673,14 +713,30 @@ impl Model {
     }
 
     fn failed(&mut self, failure: Failure) {
+        self.failed_with(failure, true);
+    }
+
+    /// Handles a failure; `schedule` sets the next refresh from it.
+    fn failed_with(&mut self, failure: Failure, schedule: bool) {
+        self.heard(&failure);
+        if failure.kind == FailureKind::Blocked {
+            self.paused_until = failure.retry_at;
+        }
+        let retry = if schedule {
+            self.retry_after(&failure)
+        } else {
+            None
+        };
         match failure.kind {
             FailureKind::NeedsLogin => {
                 self.account = None;
                 self.open_login();
             }
-            FailureKind::TooSoon => {}
-            FailureKind::Blocked => self.next_refresh = Some(self.now + self.refresh_every),
-            FailureKind::Other => self.next_refresh = Some(self.now + RETRY_AFTER_FAILURE),
+            // Never sooner than planned for a refusal.
+            FailureKind::TooSoon | FailureKind::Blocked => {
+                self.next_refresh = self.next_refresh.max(retry);
+            }
+            FailureKind::Other => self.next_refresh = retry.or(self.next_refresh),
         }
         let tone = match failure.kind {
             FailureKind::TooSoon => Tone::Info,
@@ -688,6 +744,38 @@ impl Model {
             FailureKind::Blocked | FailureKind::Other => Tone::Bad,
         };
         self.log(tone, failure.message);
+    }
+
+    /// Notes whether MELCloud answered a request that failed.
+    fn heard(&mut self, failure: &Failure) {
+        if let Some(reached) = failure.reached {
+            self.unreachable = !reached;
+        }
+    }
+
+    /// A request went through: MELCloud answers, and nothing holds the next one back.
+    fn answered(&mut self) {
+        self.unreachable = false;
+        self.failures_in_row = 0;
+        self.paused_until = None;
+    }
+
+    /// When to try again after a failure: refusals by the budget wait as it says, but at most
+    /// one refresh interval, so lifting a pause with `klima unblock` takes effect; other
+    /// failures wait longer each time in a row.
+    fn retry_after(&mut self, failure: &Failure) -> Option<Timestamp> {
+        let interval = self.now + self.refresh_every;
+        match failure.kind {
+            FailureKind::NeedsLogin => None,
+            FailureKind::TooSoon | FailureKind::Blocked => {
+                Some(failure.retry_at.map_or(interval, |at| at.min(interval)))
+            }
+            FailureKind::Other => {
+                self.failures_in_row = self.failures_in_row.saturating_add(1);
+                let doubled = 1_i32 << (self.failures_in_row - 1).min(8);
+                Some((self.now + RETRY_AFTER_FAILURE * doubled).min(interval))
+            }
+        }
     }
 
     fn open_login(&mut self) {
@@ -750,6 +838,11 @@ impl Model {
             Some(Action::Discard) => self.discard(),
             Some(Action::Refresh) if self.account.is_none() => self.open_login(),
             Some(Action::Refresh) if on_the_way => {}
+            // Without a device list there is nothing to read yet: ask for the list now.
+            Some(Action::Refresh) if self.devices.is_none() => {
+                self.devices_retry = None;
+                return self.due();
+            }
             Some(Action::Refresh) => return self.refresh(true),
             Some(Action::NextTab) => self.tab = (self.tab + 1) % TABS.len(),
             Some(Action::Tab(index)) if index < TABS.len() => self.tab = index,
@@ -1041,6 +1134,7 @@ pub(crate) mod tests {
             }),
             email: None,
             animations: true,
+            colors: true,
         }
     }
 
@@ -1153,6 +1247,8 @@ pub(crate) mod tests {
         model.update(Msg::LoggedIn(Err(Failure {
             kind: FailureKind::Other,
             message: "login failed: wrong email or password".into(),
+            retry_at: None,
+            reached: Some(true),
         })));
         let Overlay::Login(form) = &model.overlay else {
             panic!("form closed")
@@ -1193,6 +1289,8 @@ pub(crate) mod tests {
             result: Err(Failure {
                 kind: FailureKind::Other,
                 message: "could not reach MELCloud".into(),
+                retry_at: None,
+                reached: Some(false),
             }),
             manual: true,
         });
@@ -1204,6 +1302,8 @@ pub(crate) mod tests {
             result: Err(Failure {
                 kind: FailureKind::NeedsLogin,
                 message: "the MELCloud session expired".into(),
+                retry_at: None,
+                reached: Some(true),
             }),
             manual: true,
         });
@@ -1262,6 +1362,119 @@ pub(crate) mod tests {
 
     fn after(model: &mut Model, delay: SignedDuration) -> Vec<Effect> {
         model.update(Msg::Tick(model.now + delay))
+    }
+
+    fn failure(kind: FailureKind, retry_at: Option<Timestamp>, reached: Option<bool>) -> Failure {
+        Failure {
+            kind,
+            message: "failed".into(),
+            retry_at,
+            reached,
+        }
+    }
+
+    #[test]
+    fn a_failed_device_list_is_asked_for_again_only_when_the_retry_is_due() {
+        let (mut model, effects) = Model::start(Start {
+            devices: None,
+            state: None,
+            ..start()
+        });
+        assert!(
+            matches!(effects.as_slice(), [Effect::LoadDevices]),
+            "{effects:?}"
+        );
+        let unreachable = failure(FailureKind::Other, None, Some(false));
+        assert_eq!(model.update(Msg::Devices(Err(unreachable))), []);
+        assert!(model.unreachable);
+        for _ in 0..10 {
+            assert_eq!(after(&mut model, SignedDuration::from_secs(10)), []);
+        }
+        let retry = after(&mut model, SignedDuration::from_secs(20));
+        assert!(
+            matches!(retry.as_slice(), [Effect::LoadDevices]),
+            "{retry:?}"
+        );
+
+        // Failing again in a row, it waits twice as long.
+        let again = failure(FailureKind::Other, None, Some(false));
+        assert_eq!(model.update(Msg::Devices(Err(again))), []);
+        assert_eq!(after(&mut model, SignedDuration::from_secs(239)), []);
+        let retry = after(&mut model, SignedDuration::from_secs(1));
+        assert!(
+            matches!(retry.as_slice(), [Effect::LoadDevices]),
+            "{retry:?}"
+        );
+
+        // A pause of the budget is waited out, checked again after one refresh interval at most,
+        // and shown.
+        let paused = Some(model.now + SignedDuration::from_hours(6));
+        let throttled = failure(FailureKind::Blocked, paused, Some(true));
+        assert_eq!(model.update(Msg::Devices(Err(throttled))), []);
+        assert_eq!(model.paused_until, paused);
+        assert_eq!(after(&mut model, SignedDuration::from_secs(599)), []);
+        let retry = after(&mut model, SignedDuration::from_secs(1));
+        assert!(
+            matches!(retry.as_slice(), [Effect::LoadDevices]),
+            "{retry:?}"
+        );
+
+        // Without a device list, r asks for it at once.
+        let again = failure(FailureKind::Other, None, Some(false));
+        model.update(Msg::Devices(Err(again)));
+        let now = press(&mut model, KeyCode::Char('r'));
+        assert!(matches!(now.as_slice(), [Effect::LoadDevices]), "{now:?}");
+    }
+
+    #[test]
+    fn a_read_refused_as_too_soon_waits_until_the_budget_allows_it() {
+        let (mut model, first) = Model::start(Start {
+            state: Some(state(SignedDuration::from_mins(20))),
+            ..start()
+        });
+        assert!(
+            matches!(first.as_slice(), [Effect::Refresh { .. }]),
+            "{first:?}"
+        );
+        let allowed = Some(model.now + SignedDuration::from_secs(40));
+        let too_soon = failure(FailureKind::TooSoon, allowed, None);
+        let next = model.update(Msg::State {
+            result: Err(too_soon),
+            manual: false,
+        });
+        assert_eq!(next, []);
+        assert_eq!(after(&mut model, SignedDuration::from_secs(39)), []);
+        let retry = after(&mut model, SignedDuration::from_secs(1));
+        assert!(
+            matches!(retry.as_slice(), [Effect::Refresh { .. }]),
+            "{retry:?}"
+        );
+    }
+
+    #[test]
+    fn unreachable_follows_the_last_word_from_melcloud() {
+        let (mut model, _) = Model::start(start());
+        let fail = |model: &mut Model, failure| {
+            model.update(key(KeyCode::Char('r')));
+            model.update(Msg::State {
+                result: Err(failure),
+                manual: true,
+            });
+        };
+        fail(&mut model, failure(FailureKind::Other, None, Some(false)));
+        assert!(model.unreachable);
+        fail(&mut model, failure(FailureKind::TooSoon, None, None));
+        assert!(
+            model.unreachable,
+            "a local refusal says nothing about MELCloud"
+        );
+        let throttled = failure(FailureKind::Blocked, None, Some(true));
+        fail(&mut model, throttled);
+        assert!(!model.unreachable, "HTTP 429 is an answer");
+
+        fail(&mut model, failure(FailureKind::Other, None, Some(false)));
+        model.update(Msg::External(state(SignedDuration::ZERO)));
+        assert!(!model.unreachable, "another klima reached MELCloud");
     }
 
     #[test]

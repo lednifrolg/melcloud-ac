@@ -6,15 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
 
 use jiff::{SignedDuration, Timestamp};
 use melcloud::DeviceId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-use crate::files::{private_dir, read_json, write_json};
+use crate::files::{self, read_json, write_json};
 use crate::output::{local_time, seconds_until};
 use crate::paths::Paths;
 
@@ -24,6 +22,9 @@ pub const HOURLY_LIMIT: usize = 30;
 pub const READ_SPACING: SignedDuration = SignedDuration::from_secs(60);
 /// How long to stop after MELCloud answers HTTP 429.
 pub const THROTTLE_PAUSE: SignedDuration = SignedDuration::from_hours(6);
+/// How far in the future a ledger entry may lie before it counts as written by a clock that
+/// ran ahead.
+const FUTURE_TOLERANCE: SignedDuration = SignedDuration::from_mins(5);
 
 const HOUR: SignedDuration = SignedDuration::from_hours(1);
 
@@ -74,7 +75,7 @@ impl fmt::Display for Refusal {
             ),
             Self::TooSoon { next_at } => write!(
                 f,
-                "the unit was read moments ago; next read possible in {} s",
+                "the unit was asked moments ago; next read possible in {} s",
                 seconds_until(*next_at)
             ),
         }
@@ -133,7 +134,8 @@ impl Ledger {
 
     /// MELCloud locked logins for `minutes`.
     pub fn login_locked(&mut self, now: Timestamp, minutes: u32) -> Timestamp {
-        let until = now + SignedDuration::from_mins(i64::from(minutes.max(1)));
+        let lock = SignedDuration::from_mins(i64::from(minutes.max(1)));
+        let until = now.checked_add(lock).unwrap_or(Timestamp::MAX);
         self.login_locked_until = Some(until);
         until
     }
@@ -144,10 +146,20 @@ impl Ledger {
         self.throttled_until.take().is_some()
     }
 
+    /// Drops what no longer counts, and what lies in the future: written while the clock ran
+    /// ahead, it would hold requests back until that time came.
     fn forget_before(&mut self, now: Timestamp) {
-        self.requests.retain(|&at| at + HOUR > now);
-        self.last_reads.retain(|_, &mut at| at + READ_SPACING > now);
-        self.throttled_until = self.throttled_until.filter(|&until| until > now);
+        let soon = now + FUTURE_TOLERANCE;
+        let within = |at: Timestamp, span: SignedDuration| {
+            at <= soon && at.checked_add(span).is_ok_and(|end| end > now)
+        };
+        self.requests.retain(|&at| within(at, HOUR));
+        self.last_reads
+            .retain(|_, &mut at| within(at, READ_SPACING));
+        let pause = THROTTLE_PAUSE + FUTURE_TOLERANCE;
+        self.throttled_until = self
+            .throttled_until
+            .filter(|&until| until > now && until.duration_since(now) <= pause);
         self.login_locked_until = self.login_locked_until.filter(|&until| until > now);
     }
 }
@@ -169,18 +181,7 @@ pub fn requests_last_hour(paths: &Paths, now: Timestamp) -> usize {
 
 /// Runs `change` on the ledger while holding the lock that serializes all klima processes.
 pub fn update<T>(paths: &Paths, change: impl FnOnce(&mut Ledger) -> T) -> Result<T, AppError> {
-    let lock_path = paths.ledger_lock();
-    if let Some(dir) = lock_path.parent() {
-        private_dir(dir)?;
-    }
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(&lock_path)
-        .map_err(|e| AppError::io(&lock_path, e))?;
-    lock.lock().map_err(|e| AppError::io(&lock_path, e))?;
+    let _lock = files::lock(&paths.ledger_lock())?;
     let mut ledger = read_json(&paths.ledger())?.unwrap_or_default();
     let result = change(&mut ledger);
     write_json(&paths.ledger(), &ledger)?;

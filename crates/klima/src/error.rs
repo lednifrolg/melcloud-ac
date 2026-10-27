@@ -57,6 +57,9 @@ pub enum AppError {
         #[source]
         source: serde_json::Error,
     },
+    /// An error the output already explained; it sets the exit code without being repeated.
+    #[error(transparent)]
+    Shown(Box<AppError>),
 }
 
 impl AppError {
@@ -72,6 +75,7 @@ impl AppError {
             | Self::WrongDevice { .. }
             | Self::Io { .. }
             | Self::Corrupt { .. } => 1,
+            Self::Shown(error) => return error.exit_code(),
         })
     }
 

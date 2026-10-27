@@ -168,7 +168,7 @@ pub const BINDINGS: &[Binding] = &[
     Binding {
         keys: "r",
         short: "r",
-        help: "refresh now, when the request budget allows it; log in without a session",
+        help: "refresh now if the budget allows, or log in",
         label: "refresh",
         hint: Hint::Always,
         rank: 3,

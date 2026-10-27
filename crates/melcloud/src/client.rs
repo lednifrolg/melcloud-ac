@@ -1,11 +1,12 @@
 //! HTTP client for the classic MELCloud API.
 
 use std::fmt;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use jiff::Timestamp;
 use jiff::civil::DateTime;
-use reqwest::header::{ACCEPT, CONTENT_TYPE};
+use reqwest::header::{ACCEPT, CONTENT_TYPE, DATE};
 use reqwest::{RequestBuilder, StatusCode};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -133,6 +134,8 @@ impl LoginResponse {
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
+    /// The time in the `Date` header of the latest answer, shared by clones.
+    server_time: Arc<Mutex<Option<Timestamp>>>,
 }
 
 impl Client {
@@ -150,7 +153,17 @@ impl Client {
         Ok(Self {
             http,
             base_url: base_url.trim_end_matches('/').to_owned(),
+            server_time: Arc::default(),
         })
+    }
+
+    /// MELCloud's clock at its latest answer, from the `Date` header: a reference that does not
+    /// depend on the local clock being right. `None` before the first answer that had one.
+    pub fn server_time(&self) -> Option<Timestamp> {
+        *self
+            .server_time
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Logs in (`Login/ClientLogin3`). `persist` asks for a longer session, like "remember me"
@@ -227,6 +240,17 @@ impl Client {
 
     async fn send(&self, request: RequestBuilder) -> Result<Vec<u8>, Error> {
         let response = request.header(ACCEPT, JSON).send().await?;
+        let date = response.headers().get(DATE).and_then(|date| {
+            jiff::fmt::rfc2822::DateTimeParser::new()
+                .parse_timestamp(date.as_bytes())
+                .ok()
+        });
+        if let Some(date) = date {
+            *self
+                .server_time
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(date);
+        }
         let status = response.status();
         if status.is_success() {
             return Ok(response.bytes().await?.to_vec());

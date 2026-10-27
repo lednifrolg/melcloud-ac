@@ -4,7 +4,7 @@ use std::fmt::Display;
 
 use jiff::civil::Date;
 use jiff::civil::DateTime;
-use jiff::{RoundMode, SignedDuration, Timestamp, Unit, ZonedRound};
+use jiff::{SignedDuration, Timestamp};
 use melcloud::{
     AtaView, Capabilities, FanSpeed, VaneHorizontal, VaneVertical, WeatherKind, WeatherObservation,
 };
@@ -17,16 +17,18 @@ use ratatui::widgets::{
     Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, Padding, Paragraph, Wrap,
 };
 
+use super::HISTORY_SPAN;
 use super::keymap::{BINDINGS, Hint};
 use super::model::{
     Busy, Flight, LoginForm, Model, NOTICE_SHOWN, Overlay, Phase, Quit, Row, TABS, Target, Tone,
     rows,
 };
-use super::widgets::{BIG_TEXT_HEIGHT, BigText, cell, scale};
+use super::widgets::{BIG_TEXT_HEIGHT, BigText, scale};
 use crate::cache::Sample;
+use crate::chart::{Column, GAP, Timeline};
 use crate::control;
 use crate::governor::HOURLY_LIMIT;
-use crate::output::{ago, duration};
+use crate::output::{ago, duration, shorten};
 use crate::theme;
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
@@ -194,27 +196,51 @@ fn control(model: &Model, frame: &mut Frame, area: Rect, spots: &mut Vec<Hotspot
     } else {
         Span::styled("○ off", DIM)
     };
+    // A long name is cut, so the power and the model still fit on the border.
+    let model_name = device.and_then(|d| d.model.clone());
+    let room = usize::from(area.width)
+        .saturating_sub(4 + power.width() + 2)
+        .saturating_sub(model_name.as_ref().map_or(0, |m| m.chars().count() + 3));
     let heading = Line::from(vec![
         " ".into(),
-        Span::styled(name, tone.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            shorten(name, room.max(1)),
+            tone.add_modifier(Modifier::BOLD),
+        ),
         " ".into(),
         power,
         " ".into(),
     ]);
     let mut block = pane(heading, color.unwrap_or(MUTED));
-    if let Some(model_name) = device.and_then(|d| d.model.clone()) {
+    if let Some(model_name) = model_name {
         block = block.title_top(dim_title(&model_name));
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // The settings come before the command status, and both before the spacing: a setting that
+    // can be selected must be on screen.
+    let settings = device
+        .and_then(|d| d.capabilities.as_ref())
+        .map_or(0, |caps| {
+            u16::try_from(rows(caps).len()).unwrap_or(u16::MAX)
+        });
+    let mut spare = inner.height.saturating_sub(BIG_TEXT_HEIGHT + 2);
+    let mut take = |wanted: u16| {
+        let given = wanted.min(spare);
+        spare -= given;
+        given
+    };
+    let settings = take(settings);
+    let status = take(2);
+    let gaps = [take(1), take(1)];
     let [digits_row, _, scale_rows, _, rows_area, status_area] = Layout::vertical([
         Constraint::Length(BIG_TEXT_HEIGHT),
-        Constraint::Length(1),
+        Constraint::Length(gaps[0]),
         Constraint::Length(2),
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(2),
+        Constraint::Length(gaps[1]),
+        Constraint::Min(settings),
+        Constraint::Length(status),
     ])
     .areas(inner);
     let flashing = model.flash_until.is_some_and(|until| until > model.now);
@@ -238,13 +264,33 @@ fn control(model: &Model, frame: &mut Frame, area: Rect, spots: &mut Vec<Hotspot
         DIM,
     );
     frame.render_widget(line, scale_line);
-    let legend = format!(
-        "   ● target  ┃ room · {} {}-{} · step {}",
-        view.mode, range.min, range.max, caps.temperature_step
-    );
+    let parts = [
+        "   ● target  ┃ room".to_owned(),
+        format!("{} {}-{}", view.mode, range.min, range.max),
+        format!("step {}", caps.temperature_step),
+    ];
+    let legend = joined(parts, usize::from(legend_line.width));
     frame.render_widget(Line::styled(legend, DIM), legend_line);
     control_rows(model, &view, caps, color, frame, rows_area, spots);
     command_status(model, frame, status_area);
+}
+
+/// `parts` joined by " · " as far as they fit in `width`; the parts that do not fit are left
+/// out from the end, never cut.
+fn joined(parts: impl IntoIterator<Item = String>, width: usize) -> String {
+    let mut text = String::new();
+    for part in parts {
+        let next = if text.is_empty() {
+            part
+        } else {
+            format!("{text} · {part}")
+        };
+        if next.chars().count() > width {
+            break;
+        }
+        text = next;
+    }
+    text
 }
 
 /// The target in big digits, with the room and outside temperature beside it.
@@ -326,9 +372,13 @@ fn control_rows(
 ) {
     let selected = model.row;
     let moving = model.moving();
+    // When not every setting fits, the list scrolls so the selected one shows.
+    let all = rows(caps);
+    let index = all.iter().position(|&row| row == selected).unwrap_or(0);
+    let first = index.saturating_sub(usize::from(area.height).saturating_sub(1));
     let tone = color.map_or(DIM, |c| Style::new().fg(c));
     let mut specific = Vec::new();
-    for (row, y) in rows(caps).into_iter().zip(area.y..area.bottom()) {
+    for (row, y) in all.into_iter().skip(first).zip(area.y..area.bottom()) {
         let x = area.x + MARKER + LABEL;
         let spans = match row {
             Row::Temperature => vec![
@@ -704,21 +754,25 @@ fn unit(model: &Model, frame: &mut Frame, area: Rect) {
     );
 }
 
-/// Time the history chart spans.
-const DAY: SignedDuration = SignedDuration::from_hours(24);
-/// Samples further apart are not joined: the unit was not read in between.
-const GAP: SignedDuration = SignedDuration::from_mins(45);
+/// Colors of the room and target temperature in the history chart.
+const ROOM: Color = Color::Indexed(4);
+const TARGET: Color = MUTED;
 
 fn history(model: &Model, frame: &mut Frame, area: Rect) {
-    let since = model.now - DAY;
-    let samples: Vec<&Sample> = model.history.iter().filter(|s| s.at >= since).collect();
-    let mut block = pane(title("History · 24 h"), MUTED);
+    let since = model.now - HISTORY_SPAN;
+    let samples: Vec<Sample> = model
+        .history
+        .iter()
+        .filter(|s| s.at >= since)
+        .copied()
+        .collect();
+    let mut block = pane(title("History · 24h"), MUTED);
     match samples.len() {
         0 => {}
         1 => block = block.title_top(dim_title("1 sample")),
         n => block = block.title_top(dim_title(&format!("{n} samples"))),
     }
-    if samples.len() < 2 {
+    if samples.is_empty() {
         let text = "Every read of the unit adds a sample of the room temperature; the chart fills up over the day.";
         frame.render_widget(
             Paragraph::new(text)
@@ -729,6 +783,22 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
         );
         return;
     }
+    // The legend sits on the border, away from the values on the left that it could be read as.
+    // Without colors, the target is drawn in dots instead of a line.
+    let (target_marker, target_mark) = if model.colors {
+        (Marker::Braille, "━")
+    } else {
+        (Marker::Dot, "•")
+    };
+    let mut legend = vec![" ".into(), Span::styled("━ room", Style::new().fg(ROOM))];
+    if samples.iter().any(|s| s.power) {
+        legend.extend([
+            "  ".into(),
+            Span::styled(format!("{target_mark} target"), Style::new().fg(TARGET)),
+        ]);
+    }
+    legend.push(" ".into());
+    block = block.title_bottom(Line::from(legend).right_aligned());
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let [plot_rows, ribbon_row, axis_row] = Layout::vertical([
@@ -741,42 +811,48 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
     let [labels, plot] = columns.areas(plot_rows);
     let [ribbon_label, ribbon] = columns.areas(ribbon_row);
     let [_, axis] = columns.areas(axis_row);
+    let timeline = Timeline {
+        since,
+        now: model.now,
+        width: usize::from(plot.width),
+    };
 
-    let rooms = samples.iter().map(|s| s.room);
-    let low = rooms.clone().fold(f64::INFINITY, f64::min);
-    let high = rooms.fold(f64::NEG_INFINITY, f64::max);
+    // The target matters only while the unit runs.
+    let target = |s: &Sample| s.power.then_some(s.target);
+    let values: Vec<f64> = samples
+        .iter()
+        .flat_map(|s| [Some(s.room), target(s)])
+        .flatten()
+        .collect();
+    let low = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let mut label_lines = vec![Line::default(); usize::from(labels.height)];
-    if let [first, .., last] = label_lines.as_mut_slice() {
+    if high - low < 0.05 {
+        // A flat line runs mid-height, with its one value beside it.
+        let middle = label_lines.len() / 2;
+        if let Some(line) = label_lines.get_mut(middle) {
+            *line = Line::styled(format!("{high:.1}°"), DIM);
+        }
+    } else if let [first, .., last] = label_lines.as_mut_slice() {
         *first = Line::styled(format!("{high:.1}°"), DIM);
         *last = Line::styled(format!("{low:.1}°"), DIM);
-    }
-    if label_lines.len() >= 3 {
-        let middle = label_lines.len() / 2;
-        label_lines[middle] = Line::styled("room", DIM);
     }
     frame.render_widget(Paragraph::new(label_lines), labels);
     frame.render_widget(Line::styled("mode", DIM), ribbon_label);
 
-    // Gaps without reads split the line.
-    let x = |at: Timestamp| at.duration_since(since).as_secs_f64();
-    let mut segments: Vec<Vec<(f64, f64)>> = Vec::new();
-    let mut previous: Option<Timestamp> = None;
-    for sample in &samples {
-        match segments.last_mut() {
-            Some(segment) if previous.is_some_and(|p| sample.at.duration_since(p) <= GAP) => {
-                segment.push((x(sample.at), sample.room));
-            }
-            _ => segments.push(vec![(x(sample.at), sample.room)]),
-        }
-        previous = Some(sample.at);
-    }
-    let datasets = segments
+    let targets = segments(&samples, &timeline, target);
+    let rooms = segments(&samples, &timeline, |s| Some(s.room));
+    // The room line is drawn last, so it stays on top where the two meet.
+    let lines = targets
         .iter()
-        .map(|points| {
+        .map(|points| (points, TARGET, target_marker))
+        .chain(rooms.iter().map(|points| (points, ROOM, Marker::Braille)));
+    let datasets = lines
+        .map(|(points, color, marker)| {
             Dataset::default()
-                .marker(Marker::Braille)
+                .marker(marker)
                 .graph_type(GraphType::Line)
-                .style(Style::new().fg(Color::Indexed(4)))
+                .style(Style::new().fg(color))
                 .data(points)
         })
         .collect();
@@ -784,81 +860,78 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
     // flat day runs mid-height.
     let margin = ((high - low) / (f64::from(plot.height) * 4.0)).max(0.05);
     let chart = Chart::new(datasets)
-        .x_axis(Axis::default().bounds([0.0, DAY.as_secs_f64()]))
+        .x_axis(Axis::default().bounds([0.0, 1.0]))
         .y_axis(Axis::default().bounds([low - margin, high + margin]))
         .legend_position(None);
     frame.render_widget(chart, plot);
-    frame.render_widget(mode_ribbon(&samples, since, ribbon.width), ribbon);
-    frame.render_widget(time_axis(model, axis.width), axis);
+    frame.render_widget(mode_ribbon(&timeline, &model.history, model.colors), ribbon);
+    frame.render_widget(Line::styled(timeline.axis(&model.tz), DIM), axis);
+}
+
+/// Points of `value` over the timeline, split where the unit went unread for longer than
+/// [`GAP`] or `value` has nothing.
+fn segments(
+    samples: &[Sample],
+    timeline: &Timeline,
+    value: impl Fn(&Sample) -> Option<f64>,
+) -> Vec<Vec<(f64, f64)>> {
+    let mut segments: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut previous: Option<Timestamp> = None;
+    for sample in samples {
+        let Some(y) = value(sample) else {
+            previous = None;
+            continue;
+        };
+        let point = (timeline.share(sample.at), y);
+        match segments.last_mut() {
+            Some(segment) if previous.is_some_and(|p| sample.at.duration_since(p) <= GAP) => {
+                segment.push(point);
+            }
+            _ => segments.push(vec![point]),
+        }
+        previous = Some(sample.at);
+    }
+    segments
 }
 
 /// One cell per column of the chart: the mode the unit ran in, a dot while it was off, nothing
-/// while it was not read.
-fn mode_ribbon(samples: &[&Sample], since: Timestamp, width: u16) -> Line<'static> {
-    let column = DAY / i32::from(width.max(1));
-    let cells = (0..width).map(|index| {
-        let start = since + column * i32::from(index);
-        let state = samples
-            .iter()
-            .rev()
-            .find(|s| s.at < start + column)
-            .filter(|s| start.duration_since(s.at) <= GAP);
-        match state {
-            Some(s) if s.power => Span::styled(
+/// while it was not read. Without colors, the mode's first letter.
+fn mode_ribbon(timeline: &Timeline, samples: &[Sample], colors: bool) -> Line<'static> {
+    let cells = timeline
+        .columns(samples)
+        .into_iter()
+        .map(|column| match column {
+            Some(Column {
+                running: Some(mode),
+                ..
+            }) if !colors => mode.to_string().chars().take(1).collect::<String>().into(),
+            Some(Column {
+                running: Some(mode),
+                ..
+            }) => Span::styled(
                 "▀",
-                Style::new().fg(Color::Indexed(theme::mode_color(s.mode))),
+                Style::new().fg(Color::Indexed(theme::mode_color(mode))),
             ),
             Some(_) => Span::styled("·", DIM),
             None => " ".into(),
-        }
-    });
+        });
     Line::from(cells.collect::<Vec<_>>())
 }
 
-/// Clock hours under the chart, every 6 h where they fit, else every 12 h, with "now" at the
-/// right edge.
-fn time_axis(model: &Model, width: u16) -> Line<'static> {
-    let width = usize::from(width);
-    let every = if width >= 40 { 6 } else { 12 };
-    let since = model.now - DAY;
-    let last = width.saturating_sub(1);
-    let mut marks = vec![(last, "now".to_owned())];
-    let mut hour = since
-        .to_zoned(model.tz.clone())
-        .round(ZonedRound::new().smallest(Unit::Hour).mode(RoundMode::Ceil))
-        .ok();
-    while let Some(at) = hour.take().filter(|at| at.timestamp() < model.now) {
-        if at.hour() % every == 0 {
-            let share = at.timestamp().duration_since(since).as_secs_f64() / DAY.as_secs_f64();
-            marks.push((cell(share, last), at.strftime("%H:%M").to_string()));
-        }
-        hour = at.checked_add(SignedDuration::from_hours(1)).ok();
-    }
-    // Labels are centered on their time; from the right, one that would touch the label after it
-    // is left out, so "now" always shows.
-    marks[1..].sort_by_key(|&(center, _)| std::cmp::Reverse(center));
-    let mut text = vec![' '; width];
-    let mut limit = width;
-    for (center, label) in marks {
-        let start = center
-            .saturating_sub(label.len() / 2)
-            .min(width.saturating_sub(label.len()));
-        if start + label.len() > limit {
-            continue;
-        }
-        for (slot, glyph) in text[start..].iter_mut().zip(label.chars()) {
-            *slot = glyph;
-        }
-        limit = start.saturating_sub(1);
-    }
-    Line::styled(text.into_iter().collect::<String>(), DIM)
-}
-
-/// Splits `text` into lines of at most `width` characters at spaces; a longer word gets its own
-/// line.
+/// Splits `text` into lines of at most `width` characters at spaces; a longer word, like a URL,
+/// is broken where the line ends.
 fn wrap_words(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
     let mut lines: Vec<String> = Vec::new();
-    for word in text.split_whitespace() {
+    let chars = |word: &str| word.chars().collect::<Vec<_>>();
+    let pieces = text.split_whitespace().flat_map(|word| {
+        chars(word)
+            .chunks(width)
+            .map(|piece| piece.iter().collect::<String>())
+            .collect::<Vec<_>>()
+    });
+    for word in pieces {
+        let word = word.as_str();
         match lines.last_mut() {
             Some(line) if line.chars().count() + 1 + word.chars().count() <= width => {
                 line.push(' ');
@@ -911,6 +984,11 @@ fn activity(model: &Model, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// A device name in the status line is cut with "…" to this length before the link and the
+/// countdown give way, and to the shorter one after.
+const SHORT_NAME: usize = 20;
+const SHORTEST_NAME: usize = 12;
+
 fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
     let view = model.state.as_ref().map(|s| s.value.view());
     let color = view.and_then(mode_color).unwrap_or(Color::Indexed(7));
@@ -922,14 +1000,26 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
         (Some(_), _) => "LOADING",
         (None, _) => "READY",
     };
-    let name = model.device().map_or("klima", |d| d.name.as_str());
-    let head = vec![
-        Span::styled(format!(" {label} "), BOLD.fg(Color::Black).bg(color)),
-        Span::styled(format!(" {name} "), BOLD.bg(MUTED)),
-    ];
-    // Each segment has the rank it is dropped in when the window is narrow: highest first.
+    let mut name = model
+        .device()
+        .map_or("klima", |d| d.name.as_str())
+        .to_owned();
+    // Each segment has the rank it is dropped in when the window is narrow: highest first. Rank
+    // 0 stays longest, after a long device name has been shortened.
     let mut segments: Vec<(u8, Vec<Span>)> = Vec::new();
-    if let Some(view) = view {
+    if let Some(until) = model.paused_until.filter(|&until| until > model.now) {
+        let until = until
+            .to_zoned(model.tz.clone())
+            .strftime("%H:%M")
+            .to_string();
+        let text = format!("○ requests paused until {until}");
+        segments.push((0, vec![Span::styled(text, Style::new().fg(WARN))]));
+    } else if model.unreachable {
+        segments.push((
+            0,
+            vec![Span::styled("○ MELCloud unreachable", Style::new().fg(BAD))],
+        ));
+    } else if let Some(view) = view {
         let mut link = vec![if view.offline {
             Span::styled("○ offline", Style::new().fg(WARN))
         } else {
@@ -960,8 +1050,11 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
     };
     segments.push((4, vec![session]));
 
-    let line = |segments: &[(u8, Vec<Span<'static>>)]| {
-        let mut spans = head.clone();
+    let line = |name: &str, segments: &[(u8, Vec<Span<'static>>)]| {
+        let mut spans = vec![
+            Span::styled(format!(" {label} "), BOLD.fg(Color::Black).bg(color)),
+            Span::styled(format!(" {name} "), BOLD.bg(MUTED)),
+        ];
         for (index, (_, segment)) in segments.iter().enumerate() {
             spans.push(if index == 0 {
                 " ".into()
@@ -972,13 +1065,33 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
         }
         Line::from(spans)
     };
-    while line(&segments).width() > usize::from(area.width) {
-        let Some(least) = (0..segments.len()).max_by_key(|&i| segments[i].0) else {
+    // Narrow windows lose the budget and the session first, then a long name gets shorter, then
+    // the link and the countdown go, then the name gets shorter still. What rank 0 says stays.
+    let width = usize::from(area.width);
+    loop {
+        let over = line(&name, &segments).width().saturating_sub(width);
+        if over == 0 {
             break;
+        }
+        let least = (0..segments.len()).max_by_key(|&i| segments[i].0);
+        let rank = least.map_or(0, |i| segments[i].0);
+        let length = name.chars().count();
+        let shortest = if rank > 2 {
+            usize::MAX
+        } else if rank > 0 {
+            SHORT_NAME
+        } else {
+            SHORTEST_NAME
         };
-        segments.remove(least);
+        match least {
+            _ if length > shortest => {
+                name = shorten(&name, length.saturating_sub(over).max(shortest));
+            }
+            Some(i) => drop(segments.remove(i)),
+            None => break,
+        }
     }
-    frame.render_widget(line(&segments), area);
+    frame.render_widget(line(&name, &segments), area);
 }
 
 fn refresh_countdown(model: &Model) -> Vec<Span<'static>> {
@@ -1165,7 +1278,7 @@ mod tests {
     use super::*;
     use crate::tui::model::tests::{now, start, state};
     use crate::tui::model::{Msg, Start};
-    use ratatui::crossterm::event::KeyCode;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     fn screen(model: &Model, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -1194,6 +1307,8 @@ mod tests {
                     },
                     target: 22.0,
                     room: 21.0 + wave,
+                    outside: Some(2.0),
+                    fan: Some(FanSpeed::Level(2)),
                 }
             })
             .collect();
@@ -1295,6 +1410,24 @@ mod tests {
     }
 
     #[test]
+    fn every_setting_is_on_screen_when_selected() {
+        for (width, height, tab) in [(46, 19, 0), (100, 28, 0)] {
+            let mut model = lived_in();
+            model.tab = tab;
+            for _ in 0..4 {
+                model.update(Msg::Key(KeyEvent::from(KeyCode::Down)));
+            }
+            let text = screen(&model, width, height);
+            assert!(text.contains("▸ vane ↔"), "{width}x{height}:\n{text}");
+            for _ in 0..4 {
+                model.update(Msg::Key(KeyEvent::from(KeyCode::Up)));
+            }
+            let text = screen(&model, width, height);
+            assert!(text.contains("▸ temp"), "{width}x{height}:\n{text}");
+        }
+    }
+
+    #[test]
     fn window_too_small() {
         insta::assert_snapshot!(screen(&lived_in(), 40, 12));
     }
@@ -1339,22 +1472,6 @@ mod tests {
     }
 
     #[test]
-    fn the_time_axis_shows_clock_hours_up_to_now() {
-        let model = lived_in();
-        let axis = |width| time_axis(&model, width).to_string();
-        assert_eq!(axis(30), "12:00          00:00       now");
-        assert_eq!(
-            axis(12),
-            "12:00    now",
-            "an hour too close to now is left out"
-        );
-        assert_eq!(
-            axis(50),
-            "  12:00       18:00       00:00        06:00   now"
-        );
-    }
-
-    #[test]
     fn activity_wraps_under_the_text() {
         assert_eq!(
             wrap_words("the unit was read moments ago", 12),
@@ -1362,7 +1479,7 @@ mod tests {
         );
         assert_eq!(
             wrap_words("a verylongword b", 4),
-            ["a", "verylongword", "b"]
+            ["a", "very", "long", "word", "b"]
         );
     }
 }

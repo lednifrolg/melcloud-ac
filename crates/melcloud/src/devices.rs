@@ -6,6 +6,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 use crate::caps::{Capabilities, Permissions};
+use crate::text::printable;
 
 /// Device identifier (`DeviceID`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -198,8 +199,8 @@ impl Device {
         Self {
             id: entry.device_id,
             building_id: building.id,
-            building_name: building.name.clone().unwrap_or_default(),
-            name: entry.device_name.clone(),
+            building_name: printable(building.name.clone().unwrap_or_default()),
+            name: printable(entry.device_name.clone()),
             kind,
             access_level: entry.access_level,
             permissions: entry.permissions,
@@ -207,7 +208,8 @@ impl Device {
                 .units
                 .iter()
                 .find(|u| u.is_indoor)
-                .and_then(|u| u.model.clone()),
+                .and_then(|u| u.model.clone())
+                .map(printable),
             capabilities,
             // The app checks `MqttFlags & 10 == 8`.
             instant_delivery: info.mqtt_flags & 0b1010 == 0b1000,

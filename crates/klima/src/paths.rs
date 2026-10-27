@@ -66,6 +66,10 @@ impl Paths {
         self.state.join("ledger.lock")
     }
 
+    pub fn history_lock(&self) -> PathBuf {
+        self.state.join("history.lock")
+    }
+
     pub fn history(&self) -> PathBuf {
         self.state.join("history.jsonl")
     }

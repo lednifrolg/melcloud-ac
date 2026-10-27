@@ -389,5 +389,260 @@ async fn old_state_is_shown_with_the_reason_it_was_not_refreshed() {
         "{text}"
     );
     assert!(text.contains("updated 20 min ago · cached"), "{text}");
-    assert!(stderr(&output).contains("HTTP 500"), "{}", stderr(&output));
+    assert_eq!(stderr(&output), "", "the reason is not repeated");
+
+    // Moments later the read is refused for spacing, but the state is still the old one.
+    let again = klima.run(&[&LIVING_ROOM[..], &["status"]].concat()).await;
+    assert_eq!(code(&again), 3);
+    let text = stdout(&again);
+    assert!(
+        text.contains("! not refreshed: the unit was asked moments ago; next read possible in"),
+        "{text}"
+    );
+    assert_eq!(klima.requests_to("/Device/Get").await, 1);
+}
+
+/// Writes history lines for the living room, `minutes` ago each, with `power` and `mode`.
+fn write_history(klima: &Klima, samples: &[(i64, bool, &str, f64)]) {
+    let state = klima.file("state");
+    fs::create_dir_all(&state).unwrap();
+    let mut lines: Vec<String> = samples
+        .iter()
+        .map(|&(minutes, power, mode, target)| {
+            let at = Timestamp::now() - SignedDuration::from_mins(minutes);
+            json!({
+                "at": at, "device": 1_000_001, "power": power, "mode": mode,
+                "target": target, "room": 21.5, "outside": 3.0, "fan": "auto", "error_code": 8000
+            })
+            .to_string()
+        })
+        .collect();
+    let other = json!({
+        "at": Timestamp::now(), "device": 1_000_002, "power": true, "mode": "cool",
+        "target": 18.0, "room": 30.0, "fan": "1", "error_code": 8000
+    });
+    lines.push(other.to_string());
+    lines.push("not a sample".into());
+    fs::write(state.join("history.jsonl"), lines.join("\n") + "\n").unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_charts_the_day_and_lists_the_changes_without_reading_the_unit() {
+    let klima = Klima::new().await;
+    klima.login_for(SignedDuration::from_hours(1)).await;
+    klima.mock_account().await;
+    write_history(
+        &klima,
+        &[
+            (300, false, "heat", 22.0),
+            (240, false, "heat", 22.0),
+            (180, true, "heat", 22.0),
+            (120, true, "heat", 23.5),
+            (60, true, "cool", 23.5),
+            (30, true, "cool", 23.5),
+        ],
+    );
+
+    let output = klima.run(&[&LIVING_ROOM[..], &["history"]].concat()).await;
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.starts_with("Living room · last 24h · 6 samples · room 21.5 °C\n"),
+        "{text}"
+    );
+    let band = text.lines().find(|line| line.starts_with("mode ")).unwrap();
+    assert!(
+        band.trim_end().ends_with("······hhhhhhcccc"),
+        "letters tell the modes apart without colors: {text}"
+    );
+    assert!(
+        text.contains("now\n     h heat  c cool  · off  blank: not read\n\nFROM "),
+        "a legend of what the band shows: {text}"
+    );
+    let changes: Vec<&str> = text
+        .lines()
+        .skip_while(|line| !line.starts_with("FROM"))
+        .collect();
+    assert_eq!(
+        changes.len(),
+        5,
+        "header, the first state and three changes: {text}"
+    );
+    assert!(
+        changes[0].ends_with("POWER  MODE  TARGET  FAN    ROOM"),
+        "{text}"
+    );
+    assert!(
+        changes[1].ends_with("off    heat   22.0°  auto  21.5°"),
+        "{text}"
+    );
+    assert!(
+        changes[2].ends_with("on     heat   22.0°  auto  21.5°"),
+        "{text}"
+    );
+    assert!(
+        changes[3].ends_with("on     heat   23.5°  auto  21.5°"),
+        "{text}"
+    );
+    assert!(
+        changes[4].ends_with("on     cool   23.5°  auto  21.5°"),
+        "{text}"
+    );
+    assert_eq!(klima.requests_to("/Device/Get").await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_works_offline_with_an_old_device_list() {
+    let klima = Klima::new().await;
+    klima.login_for(SignedDuration::from_hours(1)).await;
+    klima.mock_account().await;
+    let devices = klima.run(&["devices"]).await;
+    assert_eq!(code(&devices), 0, "{}", stderr(&devices));
+    let cached = klima.file("cache/devices.json");
+    let mut list: Value = serde_json::from_str(&fs::read_to_string(&cached).unwrap()).unwrap();
+    list["fetched_at"] = json!(Timestamp::now() - SignedDuration::from_hours(24 * 30));
+    fs::write(&cached, list.to_string()).unwrap();
+    fs::remove_file(klima.file("state/session.json")).unwrap();
+    write_history(&klima, &[(60, true, "cool", 23.5)]);
+    let before = klima.server.received_requests().await.unwrap().len();
+
+    let output = klima.run(&[&LIVING_ROOM[..], &["history"]].concat()).await;
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stdout(&output).contains("· 1 sample ·"),
+        "{}",
+        stdout(&output)
+    );
+    let after = klima.server.received_requests().await.unwrap().len();
+    assert_eq!(after, before, "asks MELCloud for nothing");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_lists_the_latest_changes_and_counts_the_rest() {
+    let klima = Klima::new().await;
+    klima.login_for(SignedDuration::from_hours(1)).await;
+    klima.mock_account().await;
+    let samples: Vec<(i64, bool, &str, f64)> = (0..30)
+        .map(|i| {
+            (
+                300 - i * 10,
+                true,
+                "heat",
+                20.0 + f64::from(i32::try_from(i).unwrap()) / 2.0,
+            )
+        })
+        .collect();
+    write_history(&klima, &samples);
+
+    let output = klima.run(&[&LIVING_ROOM[..], &["history"]].concat()).await;
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("10 earlier changes hidden; --json has all"),
+        "{}",
+        stderr(&output)
+    );
+    let text = stdout(&output);
+    let rows = text
+        .lines()
+        .skip_while(|line| !line.starts_with("FROM"))
+        .count();
+    assert_eq!(rows, 21, "header and 20 rows: {text}");
+    assert!(text.trim_end().ends_with("34.5°  auto  21.5°"), "{text}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_as_json_covers_the_asked_span() {
+    let klima = Klima::new().await;
+    klima.login_for(SignedDuration::from_hours(1)).await;
+    klima.mock_account().await;
+    write_history(
+        &klima,
+        &[(300, false, "heat", 22.0), (60, true, "cool", 23.5)],
+    );
+
+    let output = klima
+        .run(&[&LIVING_ROOM[..], &["history", "--since", "2h", "--json"]].concat())
+        .await;
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(report["device"]["name"], "Living room");
+    let samples = report["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 1, "{report}");
+    assert_eq!(samples[0]["mode"], "cool");
+    assert_eq!(samples[0]["target_temperature"], 23.5);
+    assert_eq!(samples[0]["outside_temperature"], 3.0);
+    assert_eq!(samples[0]["fan_speed"], "auto");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_grows_with_every_read_of_the_unit() {
+    let klima = Klima::new().await;
+    klima.login_for(SignedDuration::from_hours(1)).await;
+    klima.mock_account().await;
+
+    let empty = klima.run(&[&LIVING_ROOM[..], &["history"]].concat()).await;
+    assert_eq!(code(&empty), 0, "{}", stderr(&empty));
+    assert!(stdout(&empty).contains("· 0 samples"), "{}", stdout(&empty));
+    assert!(
+        stderr(&empty).contains("adds a sample"),
+        "{}",
+        stderr(&empty)
+    );
+
+    let status = klima.run(&[&LIVING_ROOM[..], &["status"]].concat()).await;
+    assert_eq!(code(&status), 0, "{}", stderr(&status));
+    let output = klima
+        .run(&[&LIVING_ROOM[..], &["history", "--json"]].concat())
+        .await;
+    let report: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let samples = report["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 1, "{report}");
+    assert_eq!(samples[0]["room_temperature"], 24.5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_rejects_a_span_that_is_not_one() {
+    let klima = Klima::new().await;
+    for since in ["yesterday", "0h", "-2h"] {
+        let output = klima.run(&["history", &format!("--since={since}")]).await;
+        assert_eq!(code(&output), 2, "{since}");
+        assert!(
+            stderr(&output).contains("expected a duration such as 24h, 90m or 7d"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert_eq!(klima.server.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completions_and_man_pages_need_no_setup() {
+    let klima = Klima::new().await;
+    for (shell, expected) in [
+        ("bash", "_klima()"),
+        ("zsh", "#compdef klima"),
+        ("fish", "complete -c klima"),
+    ] {
+        let output = klima.run(&["completions", shell]).await;
+        assert_eq!(code(&output), 0, "{}", stderr(&output));
+        let script = stdout(&output);
+        assert!(script.contains(expected), "{shell}: {script}");
+        assert!(script.contains("history"), "{shell} completes the commands");
+    }
+
+    let dir = klima.file("man/man1");
+    let output = klima.run(&["man", dir.to_str().unwrap()]).await;
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let page = fs::read_to_string(dir.join("klima.1")).unwrap();
+    assert!(page.contains(".TH klima 1"), "{page}");
+    assert!(page.contains("klima\\-history(1)"), "{page}");
+    assert!(dir.join("klima-history.1").exists());
+    assert!(!dir.join("klima-help.1").exists());
+
+    assert_eq!(klima.server.received_requests().await.unwrap().len(), 0);
+    assert!(!klima.file("state").exists() && !klima.file("config").exists());
 }

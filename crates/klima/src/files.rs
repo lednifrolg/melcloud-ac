@@ -1,8 +1,8 @@
 //! Private files: owner-only permissions and atomic replacement.
 
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::Path;
 
 use serde::Serialize;
@@ -40,40 +40,73 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, AppError
 /// Replaces `path` with `value` as JSON. Readers see the old or the new file, never half of
 /// one, and the file is readable only by the owner.
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
-    let dir = parent(path);
-    private_dir(dir)?;
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let temporary = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    let write = || -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        serde_json::to_writer_pretty(&mut file, value)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)
-    };
-    write().map_err(|e| {
-        let _ = fs::remove_file(&temporary);
-        AppError::io(path, e)
+    replace(path, |file| {
+        serde_json::to_writer_pretty(&mut *file, value)?;
+        file.write_all(b"\n")
     })
 }
 
-/// Appends one JSON line to `path`.
+/// Replaces `path` with what `write` puts in a new file, atomically and readable only by the
+/// owner.
+pub fn replace(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> Result<(), AppError> {
+    let dir = parent(path);
+    private_dir(dir)?;
+    // A random name, created exclusively with owner-only permissions; deleted again on failure.
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".klima-")
+        .tempfile_in(dir)
+        .map_err(|e| AppError::io(dir, e))?;
+    write(temporary.as_file_mut())
+        .and_then(|()| temporary.as_file().sync_all())
+        .map_err(|e| AppError::io(path, e))?;
+    temporary
+        .persist(path)
+        .map_err(|e| AppError::io(path, e.error))?;
+    Ok(())
+}
+
+/// Holds an exclusive lock on the file at `path` until the returned file is dropped; klima
+/// processes take turns on what it guards.
+pub fn lock(path: &Path) -> Result<File, AppError> {
+    private_dir(parent(path))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| AppError::io(path, e))?;
+    file.lock().map_err(|e| AppError::io(path, e))?;
+    Ok(file)
+}
+
+/// Appends one JSON line to `path`. A last line cut short before, by a full disk or a crash, is
+/// ended first, so it does not swallow this one.
 pub fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
     private_dir(parent(path))?;
     let mut line = serde_json::to_vec(value).map_err(|e| AppError::io(path, e.into()))?;
     line.push(b'\n');
-    OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(path)
-        .and_then(|mut file| file.write_all(&line))
-        .map_err(|e| AppError::io(path, e))
+    let mut append = || -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)?;
+        let length = file.metadata()?.len();
+        if length > 0 {
+            let mut last = [0];
+            file.read_exact_at(&mut last, length - 1)?;
+            if last != *b"\n" {
+                line.insert(0, b'\n');
+            }
+        }
+        file.write_all(&line)
+    };
+    append().map_err(|e| AppError::io(path, e))
 }
 
 /// Deletes `path`; `false` when it did not exist.

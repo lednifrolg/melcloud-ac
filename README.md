@@ -23,6 +23,7 @@ klima login            # asks for email and password; stores only the session
 klima devices          # devices on the account (cached for a day, --fresh to ask again)
 klima status           # unit state (cached for 5 minutes, --fresh to ask again)
 klima status --json    # the same for scripts
+klima history          # room temperature and changes of the last 24 h (--since 7d, --json)
 
 klima on | off | toggle
 klima temp 22.5        # or relative to the current target: +1, -0.5
@@ -32,6 +33,15 @@ klima vane --vertical swing --horizontal split
 klima set --power on --mode heat --temp 21 --fan auto   # several changes, one command
 
 klima logout
+```
+
+Shell completions and man pages come from the binary itself:
+
+```sh
+klima completions zsh > ~/.zfunc/_klima          # also bash, fish, elvish, powershell
+klima completions bash > ~/.local/share/bash-completion/completions/klima
+klima completions fish > ~/.config/fish/completions/klima.fish
+klima man ~/.local/share/man/man1                # then `man klima`, `man klima-set`
 ```
 
 A command is checked against what the unit supports and what the account may change before
@@ -54,9 +64,11 @@ animations = true            # spinning fan, swinging vanes, flashing digits in 
 
 `klima` without a command opens a dashboard: the unit's settings with big digits and a
 temperature scale, the weather at the building, the adapter's WiFi and last contact, a chart of
-the last 24 hours and an activity log. The chart draws the room temperature over clock hours with
-a band underneath for when the unit was off or running and in which mode; it is built from every
-read of the unit, by the TUI and by commands alike, and leaves gaps where nothing was read. The
+the last 24 hours and an activity log. The chart draws the room temperature, and the target
+while the unit runs, over clock hours with a band underneath for when the unit was off or
+running and in which mode; it is built from every read of the unit, by the TUI and by commands
+alike, and leaves gaps where nothing was read. In the shell, `klima history` draws the room
+temperature and the modes and lists the changes of the settings; the history keeps 90 days. The
 TUI refreshes on its own every 10 minutes within the request budget, shows the countdown and the
 budget in the status line, and picks up changes made by `klima` commands in other terminals at
 once. While the unit runs, the fan turns at its speed and swinging vanes sweep; set
