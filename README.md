@@ -8,9 +8,9 @@ and controls a real device on a real account.
 
 ## Status
 
-Early development. Logging in, listing devices and reading a unit work; commands and the TUI
-are next. The API has been verified live for login, device listing, reading unit state and
-changing the target temperature.
+The command line works: login, devices, unit state and commands. The interactive TUI is next.
+The API has been verified live for login, device listing, reading unit state and changing the
+target temperature.
 
 ## Usage
 
@@ -21,8 +21,22 @@ klima login            # asks for email and password; stores only the session
 klima devices          # devices on the account (cached for a day, --fresh to ask again)
 klima status           # unit state (cached for 5 minutes, --fresh to ask again)
 klima status --json    # the same for scripts
+
+klima on | off | toggle
+klima temp 22.5        # or relative to the current target: +1, -0.5
+klima mode cool        # heat, dry, cool, fan, auto
+klima fan auto         # or a level from 1
+klima vane --vertical swing --horizontal split
+klima set --power on --mode heat --temp 21 --fan auto   # several changes, one command
+
 klima logout
 ```
+
+A command is checked against what the unit supports and what the account may change before
+anything is sent, leaves out settings the unit already has, and goes out as one MELCloud
+command. klima then waits until the unit's adapter has picked it up (a few seconds with MQTT)
+and checks the unit reports the new values. `--dry-run` shows the command without sending it,
+`--no-wait` returns right after sending.
 
 With several devices, pick one with `--device <name or ID>` or set it in
 `~/.config/klima/config.toml`:
@@ -46,7 +60,8 @@ MELCloud throttles a whole account for hours after too many requests and publish
 Every request from every running klima process is counted in one shared ledger:
 
 - at most 30 requests in any hour,
-- at least 60 seconds between two reads of the same unit,
+- at least 60 seconds between two reads of the same unit (a command uses one request, plus one
+  or two reads to confirm it),
 - after HTTP 429, no requests for 6 hours (`klima unblock` lifts this locally; MELCloud keeps
   its own limit),
 - after a login lockout, no login attempts until it ends.
@@ -62,6 +77,7 @@ When a fresh read is not possible, `klima status` shows the last known state and
 | 2 | wrong usage, e.g. an unknown or ambiguous device |
 | 3 | stopped by the request budget, throttling or a login lockout |
 | 4 | not logged in, or the session expired |
+| 5 | the command was sent, but the adapter did not confirm it or the unit reports other values |
 
 ## Using the API responsibly
 

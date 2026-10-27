@@ -5,12 +5,12 @@ use std::env;
 use std::future::Future;
 
 use jiff::Timestamp;
-use melcloud::{AtaState, Client, Device, DeviceList, LoginError};
+use melcloud::{AtaState, Client, Device, DeviceList, LoginError, SetAtaRequest};
 
-use crate::cache::{self, Cached, DEVICES_TTL};
+use crate::cache::{self, Cached, DEVICES_TTL, STATE_TTL};
 use crate::config::{self, Config};
 use crate::error::AppError;
-use crate::governor::{self, Request};
+use crate::governor::{self, Refusal, Request};
 use crate::paths::Paths;
 use crate::session::{self, Account};
 
@@ -102,29 +102,77 @@ impl App {
         })
     }
 
-    /// Reads the unit's state from the server and remembers it.
-    pub async fn read_state(&self, device: &Device) -> Result<Cached<AtaState>, AppError> {
+    /// Reads the unit's state from the server and remembers it. `request` is
+    /// [`Request::State`] for an ordinary read or [`Request::Confirm`] after a command.
+    pub async fn read_state(
+        &self,
+        device: &Device,
+        request: Request,
+    ) -> Result<Cached<AtaState>, AppError> {
         let account = self.account()?;
         let state = self
             .call(
-                Request::State(device.id),
+                request,
                 self.client
                     .ata_state(&account.session, device.id, device.building_id),
             )
             .await?;
-        let answered = state.view().device_id;
-        if answered != device.id {
-            return Err(AppError::WrongDevice {
-                asked: device.id,
-                answered,
-            });
-        }
+        check_device(device, &state)?;
         let now = Timestamp::now();
         cache::store(&self.paths.state_of(device.id), &state, now)?;
         cache::record_history(&self.paths, state.view(), now)?;
         Ok(Cached {
             fetched_at: now,
             value: state,
+        })
+    }
+
+    /// The state a command is built on: the cached one while it is fresh, otherwise a new read.
+    /// When that read is refused only because the unit was read moments ago, that recent state
+    /// is used.
+    pub async fn base_state(&self, device: &Device) -> Result<Cached<AtaState>, AppError> {
+        let cached = cache::load::<AtaState>(&self.paths.state_of(device.id));
+        match cached {
+            Some(cached) if cached.fresh(STATE_TTL, Timestamp::now()) => Ok(cached),
+            cached => match (
+                self.read_state(device, Request::State(device.id)).await,
+                cached,
+            ) {
+                (Ok(state), _) => Ok(state),
+                (Err(AppError::Refused(Refusal::TooSoon { .. })), Some(recent)) => Ok(recent),
+                (Err(error), _) => Err(error),
+            },
+        }
+    }
+
+    /// Sends a command and caches the state the server answers with. That state shows the new
+    /// values before the unit has applied them.
+    pub async fn send(
+        &self,
+        device: &Device,
+        command: &SetAtaRequest,
+    ) -> Result<AtaState, AppError> {
+        let account = self.account()?;
+        let answer = self
+            .call(
+                Request::Command(device.id),
+                self.client.set_ata(&account.session, command),
+            )
+            .await?;
+        check_device(device, &answer)?;
+        cache::store(&self.paths.state_of(device.id), &answer, Timestamp::now())?;
+        Ok(answer)
+    }
+}
+
+fn check_device(device: &Device, state: &AtaState) -> Result<(), AppError> {
+    let answered = state.view().device_id;
+    if answered == device.id {
+        Ok(())
+    } else {
+        Err(AppError::WrongDevice {
+            asked: device.id,
+            answered,
         })
     }
 }

@@ -14,6 +14,15 @@ use crate::output::local_time;
 pub enum AppError {
     #[error("{0}")]
     Usage(String),
+    #[error("{0}")]
+    Invalid(melcloud::ChangeError),
+    #[error(
+        "the adapter did not confirm the command within {seconds} s; it may still apply it, \
+         check later with `klima status --fresh`"
+    )]
+    NotConfirmed { seconds: u64 },
+    #[error("the adapter took the command, but the unit reports {0}")]
+    NotApplied(String),
     #[error("{path}: {message}")]
     Config { path: PathBuf, message: String },
     #[error("not logged in; run `klima login`")]
@@ -51,12 +60,13 @@ pub enum AppError {
 }
 
 impl AppError {
-    /// 2 usage, 3 blocked by limits, 4 login needed, 1 anything else.
+    /// 2 usage, 3 blocked by limits, 4 login needed, 5 command not confirmed, 1 anything else.
     pub fn exit_code(&self) -> ExitCode {
         ExitCode::from(match self {
-            Self::Usage(_) | Self::Config { .. } => 2,
+            Self::Usage(_) | Self::Config { .. } | Self::Invalid(_) => 2,
             Self::Throttled { .. } | Self::LoginLocked { .. } | Self::Refused(_) => 3,
             Self::NotLoggedIn | Self::SessionExpired => 4,
+            Self::NotConfirmed { .. } | Self::NotApplied(_) => 5,
             Self::Login(_)
             | Self::Api(_)
             | Self::WrongDevice { .. }
