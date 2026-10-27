@@ -77,7 +77,7 @@ impl Widget for BigText<'_> {
     clippy::cast_precision_loss,
     reason = "the share is clamped to 0..=1 and a scale is a few dozen cells"
 )]
-fn cell(share: f64, last: usize) -> usize {
+pub fn cell(share: f64, last: usize) -> usize {
     (share.clamp(0.0, 1.0) * last as f64).round() as usize
 }
 

@@ -12,7 +12,7 @@ use melcloud::{
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::keymap::{self, Action};
-use crate::cache::{Cached, STATE_TTL};
+use crate::cache::{Cached, STATE_TTL, Sample};
 use crate::control;
 
 /// Panes as tabs, for narrow windows.
@@ -24,6 +24,8 @@ const RETRY_AFTER_FAILURE: SignedDuration = SignedDuration::from_mins(2);
 pub const MERGE_WINDOW: SignedDuration = SignedDuration::from_secs(3);
 /// How long the result of a command stays in the control pane.
 pub const NOTICE_SHOWN: SignedDuration = SignedDuration::from_secs(5);
+/// How long the big digits light up when the target changes.
+pub const FLASH: SignedDuration = SignedDuration::from_millis(300);
 
 /// A setting row of the control pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,7 +184,7 @@ pub enum Msg {
     /// Another klima process stored a newer state.
     External(Cached<AtaState>),
     Budget(usize),
-    History(Vec<(Timestamp, f64)>),
+    History(Vec<Sample>),
 }
 
 /// Background work the TUI asks for.
@@ -211,11 +213,24 @@ pub struct Start {
     pub preferred_device: Option<String>,
     pub devices: Option<Cached<DeviceList>>,
     pub state: Option<Cached<AtaState>>,
-    pub history: Vec<(Timestamp, f64)>,
+    pub history: Vec<Sample>,
     pub requests_last_hour: usize,
     pub account: Option<Account>,
     /// Offered in the login form.
     pub email: Option<String>,
+    /// Spinning fan, swinging vanes and flashing digits.
+    pub animations: bool,
+}
+
+/// How far quitting has got.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Quit {
+    No,
+    /// Asked for while changes wait to be sent; what to do with them is asked first.
+    Asking,
+    /// Once the server has taken the command on its way.
+    AfterSend,
+    Now,
 }
 
 pub struct Model {
@@ -225,7 +240,7 @@ pub struct Model {
     pub devices: Option<Cached<DeviceList>>,
     pub device: Option<usize>,
     pub state: Option<Cached<AtaState>>,
-    pub history: Vec<(Timestamp, f64)>,
+    pub history: Vec<Sample>,
     pub busy: Option<Busy>,
     pub next_refresh: Option<Timestamp>,
     pub requests_last_hour: usize,
@@ -238,10 +253,10 @@ pub struct Model {
     pub flight: Option<Flight>,
     /// The latest result or hint for the control pane.
     pub notice: Option<Entry>,
-    /// Quit was asked for while changes wait to be sent.
-    pub quitting: bool,
-    pub quit: bool,
-    quit_after_send: bool,
+    pub quit: Quit,
+    pub animations: bool,
+    /// Until when the big digits light up after the target changed.
+    pub flash_until: Option<Timestamp>,
     preferred_device: Option<String>,
     email: Option<String>,
 }
@@ -396,9 +411,9 @@ impl Model {
             pending: None,
             flight: None,
             notice: None,
-            quitting: false,
-            quit: false,
-            quit_after_send: false,
+            quit: Quit::No,
+            animations: start.animations,
+            flash_until: None,
             preferred_device: start.preferred_device,
             email: start.email,
         };
@@ -431,16 +446,35 @@ impl Model {
         Some(view)
     }
 
-    /// Whether something moves on screen, so the TUI redraws often.
+    /// Whether something changes quickly on screen: countdowns, spinners, a flash.
     pub fn animating(&self) -> bool {
         let recent_notice = self
             .notice
             .as_ref()
             .is_some_and(|n| n.at + NOTICE_SHOWN > self.now);
-        self.pending.is_some() || self.flight.is_some() || recent_notice
+        let flashing = self.flash_until.is_some_and(|until| until > self.now);
+        self.pending.is_some() || self.flight.is_some() || recent_notice || flashing
     }
 
+    /// Whether the running unit is drawn in motion: a spinning fan, swinging vanes.
+    pub fn moving(&self) -> bool {
+        self.animations && self.shown().is_some_and(|view| view.power)
+    }
+
+    /// Handles `msg`, and lights the big digits up when it changed the target shown, whatever
+    /// the cause: a key, a discard, a read, another klima.
     pub fn update(&mut self, msg: Msg) -> Vec<Effect> {
+        let before = self.shown().map(|view| view.target_temperature);
+        let effects = self.handle(msg);
+        let after = self.shown().map(|view| view.target_temperature);
+        let changed = matches!((before, after), (Some(a), Some(b)) if (a - b).abs() > 1e-6);
+        if changed && self.animations {
+            self.flash_until = Some(self.now + FLASH);
+        }
+        effects
+    }
+
+    fn handle(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::Key(key) => return self.key(key),
             Msg::Tick(now) => self.now = now,
@@ -537,8 +571,8 @@ impl Model {
                 self.failed(failure);
             }
         }
-        if self.quit_after_send {
-            self.quit = true;
+        if self.quit == Quit::AfterSend {
+            self.quit = Quit::Now;
         }
     }
 
@@ -597,7 +631,8 @@ impl Model {
     /// the cached state is too old.
     fn due(&mut self) -> Vec<Effect> {
         // While quitting is asked about, the changes wait for the answer.
-        let closed = self.pending.is_some_and(|p| p.deadline <= self.now) && !self.quitting;
+        let closed =
+            self.pending.is_some_and(|p| p.deadline <= self.now) && self.quit != Quit::Asking;
         if closed && self.flight.is_none() {
             return self.flush();
         }
@@ -682,7 +717,7 @@ impl Model {
         let ctrl_c =
             key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c');
         if ctrl_c {
-            self.quit = true;
+            self.quit = Quit::Now;
             return Vec::new();
         }
         if let Overlay::Login(form) = &self.overlay {
@@ -695,7 +730,7 @@ impl Model {
             }
             return Vec::new();
         }
-        if self.quitting {
+        if self.quit == Quit::Asking {
             return self.quitting_key(key);
         }
         let on_the_way = self.pending.is_some() || self.flight.is_some();
@@ -719,11 +754,11 @@ impl Model {
             Some(Action::NextTab) => self.tab = (self.tab + 1) % TABS.len(),
             Some(Action::Tab(index)) if index < TABS.len() => self.tab = index,
             Some(Action::Help) => self.overlay = Overlay::Help,
-            Some(Action::Quit) if self.pending.is_some() => self.quitting = true,
+            Some(Action::Quit) if self.pending.is_some() => self.quit = Quit::Asking,
             Some(Action::Quit) if self.flight.is_some_and(|f| f.phase == Phase::Sending) => {
-                self.quit_after_send = true;
+                self.quit = Quit::AfterSend;
             }
-            Some(Action::Quit) => self.quit = true,
+            Some(Action::Quit) => self.quit = Quit::Now,
             Some(Action::Tab(_)) | None => {}
         }
         Vec::new()
@@ -733,15 +768,14 @@ impl Model {
     fn quitting_key(&mut self, key: KeyEvent) -> Vec<Effect> {
         match key.code {
             KeyCode::Enter => {
-                self.quitting = false;
-                self.quit_after_send = true;
+                self.quit = Quit::AfterSend;
                 return self.flush();
             }
             KeyCode::Char('u') => {
                 self.pending = None;
-                self.quit = true;
+                self.quit = Quit::Now;
             }
-            KeyCode::Esc => self.quitting = false,
+            KeyCode::Esc => self.quit = Quit::No,
             _ => {}
         }
         Vec::new()
@@ -1006,6 +1040,7 @@ pub(crate) mod tests {
                 expires_at: Some(now() + SignedDuration::from_hours(24 * 364)),
             }),
             email: None,
+            animations: true,
         }
     }
 
@@ -1216,9 +1251,9 @@ pub(crate) mod tests {
         assert_eq!(model.overlay, Overlay::Help);
         model.update(key(KeyCode::Char('q')));
         assert_eq!(model.overlay, Overlay::None);
-        assert!(!model.quit);
+        assert_eq!(model.quit, Quit::No);
         model.update(key(KeyCode::Char('q')));
-        assert!(model.quit);
+        assert_eq!(model.quit, Quit::Now);
     }
 
     fn press(model: &mut Model, code: KeyCode) -> Vec<Effect> {
@@ -1362,18 +1397,22 @@ pub(crate) mod tests {
         let (mut model, _) = Model::start(start());
         press(&mut model, KeyCode::Char('m'));
         press(&mut model, KeyCode::Char('q'));
-        assert!(model.quitting && !model.quit);
+        assert_eq!(model.quit, Quit::Asking);
         press(&mut model, KeyCode::Esc);
-        assert!(!model.quitting && !model.quit);
+        assert_eq!(model.quit, Quit::No);
 
         press(&mut model, KeyCode::Char('q'));
         assert!(matches!(
             press(&mut model, KeyCode::Enter).as_slice(),
             [Effect::Send { .. }]
         ));
-        assert!(!model.quit, "waits for the server to take it");
+        assert_eq!(
+            model.quit,
+            Quit::AfterSend,
+            "waits for the server to take it"
+        );
         model.update(Msg::Sent(Ok(())));
-        assert!(model.quit);
+        assert_eq!(model.quit, Quit::Now);
     }
 
     #[test]
@@ -1382,7 +1421,7 @@ pub(crate) mod tests {
         press(&mut model, KeyCode::Char('m'));
         press(&mut model, KeyCode::Char('q'));
         assert_eq!(after(&mut model, SignedDuration::from_secs(10)), []);
-        assert!(model.pending.is_some() && model.quitting);
+        assert!(model.pending.is_some() && model.quit == Quit::Asking);
         press(&mut model, KeyCode::Esc);
         assert!(matches!(
             after(&mut model, SignedDuration::ZERO).as_slice(),
@@ -1422,6 +1461,43 @@ pub(crate) mod tests {
             ..model.pending.unwrap()
         });
         assert_eq!(after(&mut model, SignedDuration::from_mins(30)), []);
+    }
+
+    #[test]
+    fn digits_flash_when_the_target_changes() {
+        let (mut model, _) = Model::start(start());
+        assert_eq!(model.flash_until, None);
+        press(&mut model, KeyCode::Char('+'));
+        assert_eq!(model.flash_until, Some(now() + FLASH));
+        assert!(model.animating());
+        model.flash_until = None;
+        press(&mut model, KeyCode::Char('m'));
+        assert_eq!(
+            model.flash_until, None,
+            "a mode change alone does not flash"
+        );
+        press(&mut model, KeyCode::Char('u'));
+        assert_eq!(
+            model.flash_until,
+            Some(now() + FLASH),
+            "discarding brings the old target back"
+        );
+
+        let (mut still, _) = Model::start(Start {
+            animations: false,
+            ..start()
+        });
+        press(&mut still, KeyCode::Char('+'));
+        assert_eq!(still.flash_until, None);
+        assert!(!still.moving());
+    }
+
+    #[test]
+    fn a_running_unit_is_drawn_in_motion() {
+        let (mut model, _) = Model::start(start());
+        assert!(model.moving());
+        press(&mut model, KeyCode::Char('P'));
+        assert!(!model.moving(), "shown as off once switched off");
     }
 
     #[test]

@@ -34,13 +34,15 @@ use crate::error::AppError;
 use crate::governor::{self, Refusal, Request};
 use crate::output;
 use crate::session;
-use model::{Account, Effect, Failure, FailureKind, Model, Msg, Row, Start, Target};
+use model::{Account, Effect, Failure, FailureKind, Model, Msg, Quit, Row, Start, Target};
 use view::Hotspot;
 
 /// How often the clock, the countdown and the watched files are updated.
 const TICK: Duration = Duration::from_secs(1);
-/// Redraw interval while something moves on screen.
+/// Redraw interval while a countdown, a spinner or a flash runs.
 const FRAME: Duration = Duration::from_millis(80);
+/// Redraw interval while the running unit is drawn in motion.
+const MOTION: Duration = Duration::from_millis(125);
 
 /// What reaches the event loop: messages for the model, and mouse events still to be placed.
 enum Incoming {
@@ -90,7 +92,7 @@ fn start(app: &App) -> Result<Start, AppError> {
     });
     let state = device.and_then(|id| cache::load::<AtaState>(&app.paths.state_of(id)));
     let history = device
-        .map(|id| cache::room_history(&app.paths, id, now - HISTORY_SPAN))
+        .map(|id| cache::history(&app.paths, id, now - HISTORY_SPAN))
         .unwrap_or_default();
     let email = app
         .config
@@ -112,6 +114,7 @@ fn start(app: &App) -> Result<Start, AppError> {
         requests_last_hour: governor::requests_last_hour(&app.paths, now),
         account,
         email,
+        animations: app.config.animations(),
     })
 }
 
@@ -129,11 +132,17 @@ async fn event_loop(
     let mut watched = Watched::default();
     let mut observed = Instant::now();
     let mut hotspots: Vec<Hotspot> = Vec::new();
-    while !model.quit {
+    while model.quit != Quit::Now {
         terminal
             .draw(|frame| hotspots = view::render(model, frame))
             .map_err(|e| AppError::io("terminal", e))?;
-        let wait = if model.animating() { FRAME } else { TICK };
+        let wait = if model.animating() {
+            FRAME
+        } else if model.moving() {
+            MOTION
+        } else {
+            TICK
+        };
         let first = tokio::select! {
             Some(incoming) = rx.recv() => incoming,
             () = tokio::time::sleep(wait) => Incoming::Msg(Box::new(Msg::Tick(Timestamp::now()))),
@@ -325,7 +334,7 @@ impl Watched {
             messages.push(Msg::External(state));
         }
         if changed(&app.paths.history(), &mut self.history) {
-            let history = cache::room_history(&app.paths, device.id, now - HISTORY_SPAN);
+            let history = cache::history(&app.paths, device.id, now - HISTORY_SPAN);
             messages.push(Msg::History(history));
         }
         messages
