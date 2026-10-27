@@ -32,7 +32,13 @@ const HOUR: SignedDuration = SignedDuration::from_hours(1);
 pub enum Request {
     Login,
     Devices,
+    /// A read of the unit's state; reads of one unit are spaced by [`READ_SPACING`].
     State(DeviceId),
+    /// A command to the unit.
+    Command(DeviceId),
+    /// The read that checks whether the unit applied a command. It is part of the command, so
+    /// it is not held back by the spacing of ordinary reads.
+    Confirm(DeviceId),
 }
 
 /// Why the ledger refused a request.
@@ -100,13 +106,19 @@ impl Ledger {
                 next_at: self.requests[0] + HOUR,
             });
         }
-        if let Request::State(device) = request {
-            if let Some(&last) = self.last_reads.get(&device) {
-                return Err(Refusal::TooSoon {
-                    next_at: last + READ_SPACING,
-                });
+        match request {
+            Request::State(device) => {
+                if let Some(&last) = self.last_reads.get(&device) {
+                    return Err(Refusal::TooSoon {
+                        next_at: last + READ_SPACING,
+                    });
+                }
+                self.last_reads.insert(device, now);
             }
-            self.last_reads.insert(device, now);
+            Request::Confirm(device) => {
+                self.last_reads.insert(device, now);
+            }
+            Request::Login | Request::Devices | Request::Command(_) => {}
         }
         self.requests.push(now);
         Ok(())
@@ -200,6 +212,35 @@ mod tests {
         );
         assert_eq!(ledger.admit(Request::State(DeviceId(2)), at(59)), Ok(()));
         assert_eq!(ledger.admit(Request::State(UNIT), at(60)), Ok(()));
+    }
+
+    #[test]
+    fn commands_and_their_checks_count_but_are_not_spaced() {
+        let mut ledger = Ledger::default();
+        ledger.admit(Request::State(UNIT), at(0)).unwrap();
+        assert_eq!(ledger.admit(Request::Command(UNIT), at(1)), Ok(()));
+        assert_eq!(ledger.admit(Request::Confirm(UNIT), at(4)), Ok(()));
+        assert_eq!(ledger.admit(Request::Confirm(UNIT), at(5)), Ok(()));
+        assert_eq!(ledger.requests.len(), 4);
+        // A check counts as a read for the spacing of the next ordinary read.
+        assert_eq!(
+            ledger.admit(Request::State(UNIT), at(61)),
+            Err(Refusal::TooSoon { next_at: at(65) })
+        );
+    }
+
+    #[test]
+    fn commands_respect_the_hourly_limit() {
+        let mut ledger = Ledger::default();
+        for i in 0..HOURLY_LIMIT {
+            ledger
+                .admit(Request::Devices, at(i64::try_from(i).unwrap()))
+                .unwrap();
+        }
+        assert!(matches!(
+            ledger.admit(Request::Command(UNIT), at(100)),
+            Err(Refusal::HourlyLimit { .. })
+        ));
     }
 
     #[test]

@@ -4,6 +4,7 @@ mod app;
 mod cache;
 mod commands;
 mod config;
+mod control;
 mod error;
 mod files;
 mod governor;
@@ -13,9 +14,11 @@ mod session;
 
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{ArgGroup, Parser, Subcommand};
+use melcloud::{FanSpeed, OperationMode, VaneHorizontal, VaneVertical};
 
 use crate::app::App;
+use crate::control::{Options, Power, Temperature, Wanted};
 use crate::error::AppError;
 
 #[derive(Debug, Parser)]
@@ -56,12 +59,156 @@ enum Command {
         #[arg(long)]
         fresh: bool,
     },
+    /// Switch the unit on.
+    On {
+        #[command(flatten)]
+        options: Options,
+    },
+    /// Switch the unit off.
+    Off {
+        #[command(flatten)]
+        options: Options,
+    },
+    /// Switch the unit on when it is off, and off when it is on.
+    Toggle {
+        #[command(flatten)]
+        options: Options,
+    },
+    /// Set the target temperature in °C: 22.5, or relative to the current one: +1, -0.5.
+    Temp {
+        /// Target in °C, or a change of it starting with + or -.
+        #[arg(allow_negative_numbers = true, value_name = "TEMP")]
+        temperature: Temperature,
+        #[command(flatten)]
+        options: Options,
+    },
+    /// Set the mode.
+    Mode {
+        #[arg(value_name = "heat|dry|cool|fan|auto")]
+        mode: OperationMode,
+        #[command(flatten)]
+        options: Options,
+    },
+    /// Set the fan speed.
+    Fan {
+        #[arg(value_name = "auto|LEVEL")]
+        speed: FanSpeed,
+        #[command(flatten)]
+        options: Options,
+    },
+    /// Point the vanes.
+    #[command(group(ArgGroup::new("direction").required(true).multiple(true)))]
+    Vane {
+        /// Up and down.
+        #[arg(long, group = "direction", value_name = "auto|1-5|swing")]
+        vertical: Option<VaneVertical>,
+        /// Left and right; split needs a unit with a wide vane.
+        #[arg(long, group = "direction", value_name = "auto|1-5|split|swing")]
+        horizontal: Option<VaneHorizontal>,
+        #[command(flatten)]
+        options: Options,
+    },
+    /// Change several settings in one command.
+    #[command(group(ArgGroup::new("settings").required(true).multiple(true)))]
+    Set {
+        #[arg(long, group = "settings", value_enum)]
+        power: Option<Power>,
+        #[arg(long, group = "settings", value_name = "heat|dry|cool|fan|auto")]
+        mode: Option<OperationMode>,
+        /// Target in °C, or relative with + or -.
+        #[arg(long, group = "settings", allow_negative_numbers = true)]
+        temp: Option<Temperature>,
+        #[arg(long, group = "settings", value_name = "auto|LEVEL")]
+        fan: Option<FanSpeed>,
+        #[arg(long, group = "settings", value_name = "auto|1-5|swing")]
+        vertical: Option<VaneVertical>,
+        #[arg(long, group = "settings", value_name = "auto|1-5|split|swing")]
+        horizontal: Option<VaneHorizontal>,
+        #[command(flatten)]
+        options: Options,
+    },
     /// Lift the local pause after MELCloud throttled the account (HTTP 429).
     Unblock,
 }
 
+/// The settings a command asks for, with the options it was given.
+fn wanted(command: &Command) -> Option<(Wanted, Options)> {
+    let power = |power| Wanted {
+        power: Some(power),
+        ..Wanted::default()
+    };
+    Some(match *command {
+        Command::On { options } => (power(Power::On), options),
+        Command::Off { options } => (power(Power::Off), options),
+        Command::Toggle { options } => (power(Power::Toggle), options),
+        Command::Temp {
+            temperature,
+            options,
+        } => (
+            Wanted {
+                temperature: Some(temperature),
+                ..Wanted::default()
+            },
+            options,
+        ),
+        Command::Mode { mode, options } => (
+            Wanted {
+                mode: Some(mode),
+                ..Wanted::default()
+            },
+            options,
+        ),
+        Command::Fan { speed, options } => (
+            Wanted {
+                fan: Some(speed),
+                ..Wanted::default()
+            },
+            options,
+        ),
+        Command::Vane {
+            vertical,
+            horizontal,
+            options,
+        } => (
+            Wanted {
+                vane_vertical: vertical,
+                vane_horizontal: horizontal,
+                ..Wanted::default()
+            },
+            options,
+        ),
+        Command::Set {
+            power,
+            mode,
+            temp,
+            fan,
+            vertical,
+            horizontal,
+            options,
+        } => (
+            Wanted {
+                power,
+                mode,
+                temperature: temp,
+                fan,
+                vane_vertical: vertical,
+                vane_horizontal: horizontal,
+            },
+            options,
+        ),
+        Command::Login { .. }
+        | Command::Logout
+        | Command::Devices { .. }
+        | Command::Status { .. }
+        | Command::Unblock => return None,
+    })
+}
+
 async fn run(cli: Cli) -> Result<(), AppError> {
     let app = App::new()?;
+    if let Some((wanted, options)) = wanted(&cli.command) {
+        return control::run(&app, cli.device.as_deref(), wanted, options, cli.json).await;
+    }
     match cli.command {
         Command::Login {
             email,
@@ -73,6 +220,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
             commands::status(&app, cli.device.as_deref(), fresh, cli.json).await
         }
         Command::Unblock => commands::unblock(&app),
+        _ => unreachable!("commands that change the unit are handled above"),
     }
 }
 

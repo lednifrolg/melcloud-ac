@@ -119,7 +119,7 @@ pub async fn devices(app: &App, fresh: bool, json: bool) -> Result<(), AppError>
 }
 
 /// Picks the device by name or ID, the configured one, or the only one.
-fn select<'a>(devices: &'a [Device], wanted: Option<&str>) -> Result<&'a Device, AppError> {
+pub fn select<'a>(devices: &'a [Device], wanted: Option<&str>) -> Result<&'a Device, AppError> {
     let names = || {
         devices
             .iter()
@@ -172,7 +172,10 @@ pub async fn status(
         Some(cached) if !fresh && cached.fresh(STATE_TTL, Timestamp::now()) => {
             (cached, Source::Cache, None)
         }
-        cached => match (app.read_state(device).await, cached) {
+        cached => match (
+            app.read_state(device, Request::State(device.id)).await,
+            cached,
+        ) {
             (Ok(state), _) => (state, Source::Server, None),
             (Err(error), Some(cached)) => (cached, Source::Cache, Some(error)),
             (Err(error), None) => return Err(error),

@@ -2,121 +2,18 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::process::{Output, Stdio};
+use std::process::Stdio;
 
-use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use wiremock::matchers::{body_partial_json, header, method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, ResponseTemplate};
 
-const LOGIN: &str = include_str!("../../melcloud/tests/data/login.json");
-const LIST_DEVICES: &str = include_str!("../../melcloud/tests/data/list-devices.json");
-const DEVICE_GET: &str = include_str!("../../melcloud/tests/data/device-get.json");
-const EMAIL: &str = "user@example.com";
-const PASSWORD: &str = "hunter2-synthetic";
-const LIVING_ROOM: [&str; 2] = ["--device", "Living room"];
+mod common;
 
-struct Klima {
-    home: tempfile::TempDir,
-    server: MockServer,
-}
-
-impl Klima {
-    async fn new() -> Self {
-        Self {
-            home: tempfile::tempdir().unwrap(),
-            server: MockServer::start().await,
-        }
-    }
-
-    async fn run(&self, args: &[&str]) -> Output {
-        self.run_with_input(args, "").await
-    }
-
-    async fn run_with_input(&self, args: &[&str], input: &str) -> Output {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_klima"))
-            .args(args)
-            .env("KLIMA_HOME", self.home.path())
-            .env("KLIMA_API_URL", self.server.uri())
-            .env("NO_COLOR", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(input.as_bytes()).await.unwrap();
-        drop(stdin);
-        child.wait_with_output().await.unwrap()
-    }
-
-    /// Logs in through the CLI with a session that expires in `valid_for`.
-    async fn login_for(&self, valid_for: SignedDuration) {
-        Mock::given(path("/Login/ClientLogin3"))
-            .respond_with(json_response(&login_response(valid_for)))
-            .up_to_n_times(1)
-            .mount(&self.server)
-            .await;
-        let output = self.login().await;
-        assert!(output.status.success(), "{}", stderr(&output));
-    }
-
-    async fn login(&self) -> Output {
-        self.run_with_input(
-            &["login", "--email", EMAIL, "--password-stdin"],
-            &format!("{PASSWORD}\n"),
-        )
-        .await
-    }
-
-    async fn mock_account(&self) {
-        Mock::given(path("/User/ListDevices"))
-            .respond_with(json_response(LIST_DEVICES))
-            .mount(&self.server)
-            .await;
-        Mock::given(path("/Device/Get"))
-            .respond_with(json_response(DEVICE_GET))
-            .mount(&self.server)
-            .await;
-    }
-
-    async fn requests_to(&self, endpoint: &str) -> usize {
-        let requests = self.server.received_requests().await.unwrap();
-        requests.iter().filter(|r| r.url.path() == endpoint).count()
-    }
-
-    fn file(&self, name: &str) -> std::path::PathBuf {
-        self.home.path().join(name)
-    }
-}
-
-fn json_response(body: &str) -> ResponseTemplate {
-    ResponseTemplate::new(200).set_body_raw(body.to_owned(), "application/json")
-}
-
-fn login_response(valid_for: SignedDuration) -> String {
-    let mut login: Value = serde_json::from_str(LOGIN).unwrap();
-    let expiry = (Timestamp::now() + valid_for)
-        .to_zoned(TimeZone::UTC)
-        .datetime();
-    login["LoginData"]["Expiry"] = json!(expiry.to_string());
-    login.to_string()
-}
-
-fn stdout(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stdout).into_owned()
-}
-
-fn stderr(output: &Output) -> String {
-    String::from_utf8_lossy(&output.stderr).into_owned()
-}
-
-fn code(output: &Output) -> i32 {
-    output.status.code().unwrap()
-}
+use common::*;
 
 #[tokio::test(flavor = "multi_thread")]
 async fn login_stores_the_session_but_never_the_password() {

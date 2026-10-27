@@ -2,15 +2,18 @@
 //! and disappear when the output is not a terminal or `NO_COLOR` is set.
 
 use std::error::Error as _;
+use std::io::{self, IsTerminal, Write};
 
-use anstream::{eprintln, println};
+use anstream::{eprint, eprintln, println};
 use anstyle::{AnsiColor, Style};
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use melcloud::{
-    AtaState, Capabilities, Device, DeviceId, DeviceKind, FanSpeed, OperationMode, WeatherKind,
+    AtaState, Capabilities, Device, DeviceId, DeviceKind, EffectiveFlags, FanSpeed, OperationMode,
+    WeatherKind,
 };
 use serde::Serialize;
+use serde_json::{Map, Value};
 
 use crate::error::AppError;
 
@@ -19,6 +22,7 @@ const BOLD: Style = Style::new().bold();
 const GREEN: Style = AnsiColor::Green.on_default();
 const YELLOW: Style = AnsiColor::Yellow.on_default();
 const RED: Style = AnsiColor::Red.on_default();
+const CYAN: Style = AnsiColor::Cyan.on_default();
 
 /// The color that stands for a mode, as in the TUI.
 fn accent(mode: OperationMode) -> Style {
@@ -414,6 +418,145 @@ pub fn devices_json(devices: &[Device]) {
         })
         .collect();
     json(&list);
+}
+
+/// One setting a command changes, for display.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct Change {
+    pub field: &'static str,
+    pub from: String,
+    pub to: String,
+}
+
+/// What a command did, for `--json`.
+pub struct CommandReport<'a> {
+    pub device: &'a Device,
+    pub changes: &'a [Change],
+    pub flags: Option<EffectiveFlags>,
+    pub dry_run: bool,
+    pub sent: bool,
+    pub adapter_delay: Option<SignedDuration>,
+    /// The JSON that would be sent; only for `--dry-run`.
+    pub body: Option<&'a Map<String, Value>>,
+}
+
+/// Width of the "✓ sent" label column, so the lines of a command line up.
+const LABEL: usize = 10;
+
+fn label(style: Style, text: &str) -> String {
+    paint(style, format!("{text:<LABEL$}"))
+}
+
+fn changes_line(changes: &[Change]) -> String {
+    changes
+        .iter()
+        .map(|c| {
+            format!(
+                "{} {} {} {}",
+                paint(DIM, c.field),
+                c.from,
+                paint(DIM, "→"),
+                paint(BOLD, &c.to)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(&paint(DIM, " · "))
+}
+
+fn flags_line(flags: EffectiveFlags) -> String {
+    paint(
+        DIM,
+        format!("{:LABEL$}SetAta, flags 0x{:02X}", "", flags.bits()),
+    )
+}
+
+pub fn would_send(changes: &[Change], flags: EffectiveFlags) {
+    println!("{}{}", label(YELLOW, "→ dry run"), changes_line(changes));
+    println!("{}", flags_line(flags));
+}
+
+pub fn sent(changes: &[Change], flags: EffectiveFlags) {
+    println!("{}{}", label(GREEN, "✓ sent"), changes_line(changes));
+    println!("{}", flags_line(flags));
+}
+
+pub fn applied(adapter_delay: Option<SignedDuration>) {
+    let detail = match adapter_delay {
+        Some(delay) => format!(
+            "the adapter took it {:.1} s after sending",
+            delay.as_secs_f64()
+        ),
+        None => "the adapter confirmed it".to_owned(),
+    };
+    println!("{}{detail}", label(GREEN, "✓ applied"));
+}
+
+/// Waits until `until`, with a spinner on stderr when it is a terminal and `show` is set.
+pub async fn wait_for_adapter(until: Timestamp, since: Timestamp, show: bool) {
+    const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+    let spinner = show && io::stderr().is_terminal();
+    let mut frame = 0;
+    loop {
+        let now = Timestamp::now();
+        let left = until.duration_since(now);
+        if left <= SignedDuration::ZERO {
+            break;
+        }
+        if spinner {
+            let elapsed = now.duration_since(since).as_secs_f64();
+            eprint!(
+                "\r{} waiting for the adapter · {elapsed:.1} s",
+                paint(CYAN, FRAMES[frame % FRAMES.len()])
+            );
+            frame += 1;
+        }
+        tokio::time::sleep(left.min(SignedDuration::from_millis(80)).unsigned_abs()).await;
+    }
+    if spinner {
+        let _ = io::stderr().write_all(b"\r\x1b[2K");
+    }
+}
+
+#[derive(Serialize)]
+struct CommandJson<'a> {
+    device: DeviceRef<'a>,
+    changes: &'a [Change],
+    flags: Option<u64>,
+    dry_run: bool,
+    sent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    confirmed: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    adapter_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    body: Option<&'a Map<String, Value>>,
+}
+
+/// `outcome` is the result of waiting for the adapter, when the command waited for it.
+pub fn command_json(
+    report: &CommandReport,
+    outcome: Option<&Result<Option<SignedDuration>, AppError>>,
+) {
+    json(&CommandJson {
+        device: DeviceRef {
+            id: report.device.id,
+            name: &report.device.name,
+        },
+        changes: report.changes,
+        flags: report.flags.map(|f| f.bits()),
+        dry_run: report.dry_run,
+        sent: report.sent,
+        confirmed: outcome.map(Result::is_ok),
+        adapter_seconds: report
+            .adapter_delay
+            .map(|d| (d.as_secs_f64() * 10.0).round() / 10.0),
+        error: outcome
+            .and_then(|o| o.as_ref().err())
+            .map(ToString::to_string),
+        body: report.body,
+    });
 }
 
 #[cfg(test)]
