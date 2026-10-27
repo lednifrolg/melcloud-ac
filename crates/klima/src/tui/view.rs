@@ -48,7 +48,8 @@ const FLASHED: Style = Style::new()
     .fg(Color::Indexed(15))
     .add_modifier(Modifier::BOLD);
 /// A turning fan.
-const FAN: [char; 4] = ['▖', '▘', '▝', '▗'];
+/// A two-blade rotor, turning.
+const FAN: [char; 2] = ['▚', '▞'];
 /// Time a swinging vane takes from one position to the next.
 const SWING_STEP: i64 = 250;
 
@@ -112,29 +113,23 @@ pub fn render(model: &Model, frame: &mut Frame) -> Vec<Hotspot> {
 }
 
 /// Height of the control pane with every setting and the command status, and the least the
-/// history under it gets; the history takes what a taller window adds.
+/// panes under it get; the history and the activity take what a taller window adds.
 const CONTROL_HEIGHT: u16 = 18;
-const HISTORY_MIN: u16 = 9;
-/// Heights of the weather pane (three forecasts and the sun) and of the unit pane.
-const OUTSIDE_HEIGHT: u16 = 6;
+const BOTTOM_MIN: u16 = 9;
+/// Height of the unit pane.
 const UNIT_HEIGHT: u16 = 7;
 
-/// Control on the left of the top row; weather, unit and activity beside it, the activity
-/// taking what the other two leave. The history spans the width below and takes what a larger
-/// window adds.
+/// Control, with the weather and the unit beside it, on a top row as high as the controls
+/// need; history and activity below, growing with the window.
 fn wide(model: &Model, frame: &mut Frame, body: Rect, spots: &mut Vec<Hotspot>) {
-    let top = body.height.saturating_sub(HISTORY_MIN).min(CONTROL_HEIGHT);
-    let [top, history_area] =
+    let top = body.height.saturating_sub(BOTTOM_MIN).min(CONTROL_HEIGHT);
+    let [top, bottom] =
         Layout::vertical([Constraint::Length(top), Constraint::Fill(1)]).areas(body);
-    let [control_area, right] = Layout::horizontal([Constraint::Fill(7), Constraint::Fill(4)])
-        .spacing(1)
-        .areas(top);
-    let [outside_area, unit_area, activity_area] = Layout::vertical([
-        Constraint::Length(OUTSIDE_HEIGHT),
-        Constraint::Length(UNIT_HEIGHT),
-        Constraint::Fill(1),
-    ])
-    .areas(right);
+    let columns = || Layout::horizontal([Constraint::Fill(7), Constraint::Fill(4)]).spacing(1);
+    let [control_area, side] = columns().areas(top);
+    let [outside_area, unit_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(UNIT_HEIGHT)]).areas(side);
+    let [history_area, activity_area] = columns().areas(bottom);
     control(model, frame, control_area, spots);
     outside(model, frame, outside_area);
     unit(model, frame, unit_area);
@@ -648,26 +643,40 @@ fn condition(name: &str) -> String {
 
 fn outside(model: &Model, frame: &mut Frame, area: Rect) {
     let block = pane(title("Outside"), MUTED).title_top(dim_title("MELCloud weather"));
-    frame.render_widget(Paragraph::new(outside_lines(model)).block(block), area);
+    let width = usize::from(area.width.saturating_sub(4));
+    frame.render_widget(
+        Paragraph::new(outside_lines(model, width)).block(block),
+        area,
+    );
 }
 
-/// The weather at the building: the forecast, then sunrise and sunset.
-fn outside_lines(model: &Model) -> Vec<Line<'static>> {
+/// The weather at the building, `width` columns wide: the forecast, then sunrise and sunset.
+/// The humidity goes where the conditions leave no room for it.
+fn outside_lines(model: &Model, width: usize) -> Vec<Line<'static>> {
     let weather = model
         .state
         .as_ref()
         .map(|s| s.value.view().weather.as_slice())
         .unwrap_or_default();
     let today = model.now.to_zoned(model.tz.clone()).date();
+    let conditions = weather
+        .iter()
+        .map(|w| condition(&w.condition).chars().count())
+        .max()
+        .unwrap_or(0);
+    let humidity = 11 + 4 + 2 + conditions + 5 <= width;
     let mut lines: Vec<Line> = weather
         .iter()
         .map(|w| {
-            Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!("{:<11}", weather_label(w.kind, w.time, today)), DIM),
                 Span::styled(format!("{:>3.0}°", w.temperature), BOLD),
-                format!("  {:<11}", condition(&w.condition)).into(),
-                Span::styled(format!("{:>3.0}%", w.humidity), DIM),
-            ])
+                format!("  {:<conditions$}", condition(&w.condition)).into(),
+            ];
+            if humidity {
+                spans.push(Span::styled(format!(" {:>3.0}%", w.humidity), DIM));
+            }
+            Line::from(spans)
         })
         .collect();
     if let Some(sun) = weather
@@ -773,6 +782,18 @@ fn unit(model: &Model, frame: &mut Frame, area: Rect) {
             Span::styled("none", Style::new().fg(GOOD))
         };
         lines.push(Line::from(vec![label("errors"), errors]));
+    }
+    // Remarks after " · " give way where the pane is too narrow for them.
+    let width = usize::from(area.width.saturating_sub(4));
+    for line in &mut lines {
+        while line.width() > width
+            && line
+                .spans
+                .last()
+                .is_some_and(|span| span.content.starts_with(" · "))
+        {
+            line.spans.pop();
+        }
     }
     frame.render_widget(
         Paragraph::new(lines).block(pane(title("Unit"), MUTED)),
@@ -1062,7 +1083,7 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
         n if n >= HOURLY_LIMIT * 4 / 5 => WARN,
         _ => Color::Reset,
     });
-    let api = format!("api {}/{HOURLY_LIMIT}·h", model.requests_last_hour);
+    let api = format!("api {}/{HOURLY_LIMIT} per h", model.requests_last_hour);
     segments.push((3, vec![Span::styled(api, budget)]));
     let session = match &model.account {
         Some(account) => match account.expires_at {
@@ -1214,8 +1235,10 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn help(frame: &mut Frame, area: Rect) {
+    // A second key for an action shares the line above it, so it gets none of its own.
     let mut lines: Vec<Line> = BINDINGS
         .iter()
+        .filter(|b| !b.help.is_empty())
         .map(|b| {
             Line::from(vec![
                 Span::styled(format!("{:<8}", b.keys), BOLD),
@@ -1480,9 +1503,9 @@ mod tests {
                 })
                 .collect::<String>()
         };
-        assert_eq!(glyphs(FanSpeed::Level(5), 125), "▖▘▝▗▖▘▝▗");
-        assert_eq!(glyphs(FanSpeed::Level(1), 625), "▖▘▝▗▖▘▝▗");
-        assert_eq!(glyphs(FanSpeed::Level(1), 125), "▖▖▖▖▖▘▘▘");
+        assert_eq!(glyphs(FanSpeed::Level(5), 125), "▚▞▚▞▚▞▚▞");
+        assert_eq!(glyphs(FanSpeed::Level(1), 625), "▚▞▚▞▚▞▚▞");
+        assert_eq!(glyphs(FanSpeed::Level(1), 125), "▚▚▚▚▚▞▞▞");
         assert_eq!(glyphs(FanSpeed::Auto, 375), glyphs(FanSpeed::Level(3), 375));
     }
 

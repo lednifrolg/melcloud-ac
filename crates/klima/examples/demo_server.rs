@@ -36,10 +36,12 @@ async fn main() {
     let Some(port) = args.next().and_then(|p| p.parse::<u16>().ok()) else {
         fail("usage: demo_server <port> [<new home directory>]");
     };
+    let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) else {
+        fail(&format!("port {port} is taken"));
+    };
     if let Some(home) = args.next().map(PathBuf::from) {
         prepare(&home);
     }
-    let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("the port is free");
     let server = MockServer::builder().listener(listener).start().await;
 
     let unit = Unit(Arc::new(Mutex::new(State {
@@ -107,11 +109,25 @@ fn utc(at: Timestamp) -> String {
         .to_string()
 }
 
-/// A local time without a zone, as MELCloud writes the weather.
-fn local(at: Timestamp) -> String {
-    at.to_zoned(TimeZone::system())
-        .strftime("%Y-%m-%dT%H:00:00")
-        .to_string()
+/// Local times without a zone, as MELCloud writes the weather: the current hour, noon today,
+/// the night after it, noon tomorrow and the night after that.
+fn forecast_dates(now: Timestamp) -> [String; 5] {
+    let today = now.to_zoned(TimeZone::system()).date();
+    let day = |offset: i32, hour: &str| {
+        let date = today
+            .checked_add(SignedDuration::from_hours(24 * i64::from(offset)))
+            .unwrap_or(today);
+        format!("{date}T{hour}:00:00")
+    };
+    [
+        now.to_zoned(TimeZone::system())
+            .strftime("%Y-%m-%dT%H:00:00")
+            .to_string(),
+        day(0, "12"),
+        day(1, "00"),
+        day(1, "12"),
+        day(2, "00"),
+    ]
 }
 
 /// The unit as MELCloud reports it, and when its adapter was last in touch.
@@ -141,14 +157,9 @@ impl Respond for ReadState {
         let state = &mut state.unit;
         state["LastCommunication"] = json!(utc(contact));
         state["NextCommunication"] = json!(utc(contact + SignedDuration::from_secs(60)));
-        let times = [
-            now,
-            now + SignedDuration::from_hours(3),
-            now + SignedDuration::from_hours(12),
-        ];
         if let Some(weather) = state["WeatherObservations"].as_array_mut() {
-            for (observation, at) in weather.iter_mut().zip(times) {
-                observation["Date"] = json!(local(at));
+            for (observation, date) in weather.iter_mut().zip(forecast_dates(now)) {
+                observation["Date"] = json!(date);
             }
         }
         json_response(&state.to_string())
@@ -185,9 +196,10 @@ impl Respond for TakeCommand {
 fn prepare(home: &Path) {
     let config = home.join("config");
     let state = home.join("state");
-    if state.join("history.jsonl").exists() {
+    // Never a real klima home: only a new or empty directory.
+    if std::fs::read_dir(home).is_ok_and(|mut entries| entries.next().is_some()) {
         fail(&format!(
-            "{} has a history already; give a new, empty directory",
+            "{} is not empty; give a new, empty directory",
             home.display()
         ));
     }

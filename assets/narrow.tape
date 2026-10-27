@@ -1,4 +1,4 @@
-# The narrow layout for the README's screenshots; see demo.tape.
+# The history tab in a narrow window, for the README; see the README's development section.
 
 Output "assets/narrow.mp4"
 

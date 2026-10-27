@@ -38,7 +38,8 @@ url="$repo/releases/download/$tag"
 curl -fsSLO "$url/klima-$target.tar.gz" &&
 curl -fsSLO "$url/SHA256SUMS" &&
 grep " klima-$target.tar.gz\$" SHA256SUMS > checksum &&
-if command -v sha256sum > /dev/null; then sha256sum -c checksum; else shasum -a 256 -c checksum; fi ||
+if command -v sha256sum > /dev/null; then sha256sum -c checksum
+else shasum -a 256 -c checksum; fi ||
 rm -f "klima-$target.tar.gz"
 ```
 
@@ -76,9 +77,9 @@ The installed binary is attested as well, so it can be checked later from any te
 without running it:
 
 ```sh
+workflow='^https://github\.com/lednifrolg/melcloud-ac/\.github/workflows/release\.yml'
 gh attestation verify ~/.local/bin/klima --repo lednifrolg/melcloud-ac \
-  --cert-identity-regex '^https://github\.com/lednifrolg/melcloud-ac/\.github/workflows/release\.yml@refs/tags/v' \
-  --deny-self-hosted-runners
+  --cert-identity-regex "$workflow@refs/tags/v" --deny-self-hosted-runners
 ```
 
 On macOS, a binary downloaded with a browser instead is quarantined and refused as unverified;
@@ -196,7 +197,8 @@ directory.
 One-shot commands suit key bindings. `--no-wait` returns once MELCloud has the command,
 without spending further requests on checking it; the TUI or `klima status` shows the result.
 Every press is a command to MELCloud and counts against the request budget below. These use
-`SUPER + CTRL + ALT`, which Omarchy leaves free.
+`SUPER + CTRL + ALT` with A, the arrows and K, which Omarchy leaves free; it binds a few other
+keys with the same modifiers, such as R, T and W.
 
 With Hyprland 0.55 or later, in `~/.config/hypr/hyprland.lua`:
 
@@ -235,7 +237,8 @@ and at the end of `~/.config/hypr/hyprland.lua`:
 o.window("org.omarchy.klima", { float = true, center = true, size = { 1100, 720 } })
 ```
 
-With Hyprland 0.54 and its `hyprland.conf` (older versions write window rules differently):
+With Hyprland 0.53 or 0.54 and `hyprland.conf` (earlier versions write window rules
+differently):
 
 ```ini
 bind = SUPER CTRL ALT, A, exec, klima toggle --no-wait
@@ -245,7 +248,15 @@ bind = SUPER CTRL ALT, K, exec, kitty --class klima klima
 windowrule = match:class ^klima$, float on, center on, size 1100 720
 ```
 
-To see what a binding did, make it send the first line of klima's answer as a notification:
+To see what a binding did, make it send the first line of klima's answer as a notification. In
+place of the A binding above, in Lua:
+
+```lua
+klima("SUPER + CTRL + ALT + A", "Air conditioner on or off",
+  [[notify-send klima "$(klima toggle --no-wait 2>&1 | head -n 1)"]])
+```
+
+or in `hyprland.conf`:
 
 ```ini
 bind = SUPER CTRL ALT, A, exec, notify-send klima "$(klima toggle --no-wait 2>&1 | head -n 1)"

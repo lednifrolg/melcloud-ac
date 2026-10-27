@@ -1,4 +1,4 @@
-# The shell screenshot in the README; see demo.tape.
+# The shell screenshot in the README; see the README's development section.
 
 Output "assets/shell.mp4"
 

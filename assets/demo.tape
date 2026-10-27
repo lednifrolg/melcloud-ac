@@ -1,14 +1,8 @@
-# The README's demo and screenshots, recorded with vhs (https://github.com/charmbracelet/vhs)
-# against the demo server in crates/klima/examples, so no request reaches MELCloud:
-#
-#   cargo build -p klima --bin klima --examples
-#   vhs assets/demo.tape
-#
-# vhs's Screenshot command misses the TUI's alternate screen, so the screenshots are frames of
-# assets/demo.mp4, picked with ffmpeg (see the README's development section).
+# The README's demo, recorded with vhs (https://github.com/charmbracelet/vhs) against the demo
+# server in crates/klima/examples, so no request reaches MELCloud. The README's development
+# section has the commands that make it and the screenshots.
 
 Output "assets/demo.gif"
-Output "assets/demo.mp4"
 
 Set Shell "bash"
 Set FontFamily "JetBrainsMono Nerd Font"
@@ -31,14 +25,11 @@ Type "PS1='\[\e[1;34m\]❯\[\e[0m\] '; clear"
 Enter
 Type "klima status"
 Enter
-Sleep 1s
+Type "klima"
+Enter
+Sleep 2s
 Show
 
-Sleep 2.5s
-
-Type "klima"
-Sleep 300ms
-Enter
 Sleep 3s
 Type "+"
 Sleep 400ms
