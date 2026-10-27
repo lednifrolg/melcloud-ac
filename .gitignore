@@ -1,9 +1,9 @@
-# Local-only research: API notes, app analysis, one-off scripts, captured responses. Never commit.
+# Local-only material, never committed
 /research/
 /out/
-
-# Design and review drafts
 /.lavish/
+/AGENTS.md
+/.cargo/config.toml
 
 # Secrets and local data
 credentials.json

@@ -1,10 +1,10 @@
 //! Guards for the synthetic test data in `tests/data`.
 //!
-//! The data is hand-written to follow the API schema and holds no captured values. When the
-//! owner's local `research/fixtures` directory exists, every field in the synthetic data must
-//! also appear in the matching captured response with the same JSON type, so the test data
-//! cannot drift from what the server actually sends. Elsewhere, including CI, that check is
-//! skipped.
+//! The data is hand-written to follow the API schema and holds no captured values. When
+//! `MELCLOUD_CAPTURED_DIR` points to a directory of captured server responses, every field in
+//! the synthetic data must also appear in the matching captured response with the same JSON
+//! type, so the test data cannot drift from what the server actually sends. Without it,
+//! including in CI, that check is skipped.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -67,11 +67,10 @@ fn synthetic_data_is_valid_json() {
 
 #[test]
 fn synthetic_data_matches_captured_schema() {
-    let captured_dir: PathBuf = manifest_dir().join("../../research/fixtures");
-    if !captured_dir.is_dir() {
-        eprintln!("skipped: {} is not present", captured_dir.display());
+    let Some(captured_dir) = std::env::var_os("MELCLOUD_CAPTURED_DIR").map(PathBuf::from) else {
+        eprintln!("skipped: MELCLOUD_CAPTURED_DIR is not set");
         return;
-    }
+    };
     let mut drift = Vec::new();
     for (synthetic, captured) in PAIRS {
         let synthetic_value = read_json(&manifest_dir().join("tests/data").join(synthetic));

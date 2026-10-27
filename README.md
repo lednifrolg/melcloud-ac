@@ -32,6 +32,10 @@ token is kept locally, readable only by you. When the session expires, log in ag
 | `crates/melcloud` | MELCloud API client, no UI dependencies |
 | `crates/klima` | the `klima` binary: CLI and TUI |
 
+Test data in `crates/melcloud/tests/data` is synthetic. Never commit captured server responses,
+credentials, session tokens or real device identifiers. Code, docs and commit messages are in
+English.
+
 The checks CI runs:
 
 ```sh
