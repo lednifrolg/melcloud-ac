@@ -14,22 +14,49 @@ klima runs on Linux and macOS; Windows is not supported.
 
 ## Install
 
-Prebuilt binaries for Linux (x86_64 and aarch64, static) and macOS (Apple silicon and Intel)
-are on the [releases page](https://github.com/lednifrolg/melcloud-ac/releases). Each archive
-holds the binary, shell completions and man pages:
+Prebuilt binaries for Linux (x86_64 and aarch64, static) and macOS 11 or later (Apple silicon
+and Intel) are on the [releases page](https://github.com/lednifrolg/melcloud-ac/releases). In
+bash or zsh, this picks the one for the machine, checks it against the release's checksums and
+installs it into `~/.local/bin`, stopping at the first step that fails:
 
 ```sh
-target=x86_64-unknown-linux-musl   # or aarch64-unknown-linux-musl, aarch64-apple-darwin, x86_64-apple-darwin
-curl -fsSLO "https://github.com/lednifrolg/melcloud-ac/releases/latest/download/klima-$target.tar.gz"
-tar -xzf "klima-$target.tar.gz"
-install -m 755 "klima-$target/klima" ~/.local/bin/
+case "$(uname -sm)" in
+  "Linux x86_64") target=x86_64-unknown-linux-musl ;;
+  "Linux aarch64") target=aarch64-unknown-linux-musl ;;
+  "Darwin arm64") target=aarch64-apple-darwin ;;
+  "Darwin x86_64") target=x86_64-apple-darwin ;;
+  *) target=none; echo "no prebuilt klima for $(uname -sm); build it from source" ;;
+esac
+cd "$(mktemp -d)"
+url=https://github.com/lednifrolg/melcloud-ac/releases/latest/download
+curl -fsSLO "$url/klima-$target.tar.gz" &&
+curl -fsSLO "$url/SHA256SUMS" &&
+grep " klima-$target.tar.gz\$" SHA256SUMS > checksum &&
+if command -v sha256sum > /dev/null; then sha256sum -c checksum; else shasum -a 256 -c checksum; fi &&
+tar -xzf "klima-$target.tar.gz" &&
+mkdir -p ~/.local/bin &&
+install -m 755 "klima-$target/klima" ~/.local/bin/ &&
+klima --version
 ```
 
-`SHA256SUMS` on the release page lists the checksums, and
-`gh attestation verify "klima-$target.tar.gz" --repo lednifrolg/melcloud-ac` checks that an
-archive was built from this repository by its release workflow.
+If the last line says the command is not found, add `export PATH="$HOME/.local/bin:$PATH"` to
+`~/.zshrc` or `~/.bashrc` and open a new terminal. The same commands update klima. Other systems,
+like a 32-bit Raspberry Pi, build from source (below).
 
-From source, with Rust installed: `cargo install --path crates/klima --locked` in a clone.
+The archive also holds shell completions in `completions/` and man pages in `man/man1/`, the
+same files `klima completions` and `klima man` write (see [Usage](#usage)). With the GitHub CLI
+logged in, this checks that the archive was built from this repository by its release workflow:
+
+```sh
+gh attestation verify "klima-$target.tar.gz" --repo lednifrolg/melcloud-ac \
+  --signer-workflow lednifrolg/melcloud-ac/.github/workflows/release.yml
+```
+
+On macOS, a binary downloaded with a browser instead is quarantined and refused as unverified;
+`xattr -d com.apple.quarantine ~/.local/bin/klima` lifts that.
+
+From source, with a recent Rust from [rustup](https://rustup.rs):
+`cargo install --git https://github.com/lednifrolg/melcloud-ac --locked klima`.
 
 ## Usage
 
@@ -51,14 +78,21 @@ klima set --power on --mode heat --temp 21 --fan auto   # several changes, one c
 klima logout
 ```
 
-Shell completions and man pages come from the binary itself:
+Shell completions and man pages come from the binary itself, for bash, zsh, fish, elvish and
+PowerShell:
 
 ```sh
-klima completions zsh > ~/.zfunc/_klima          # also bash, fish, elvish, powershell
+mkdir -p ~/.local/share/bash-completion/completions
 klima completions bash > ~/.local/share/bash-completion/completions/klima
+mkdir -p ~/.zfunc
+klima completions zsh > ~/.zfunc/_klima
+mkdir -p ~/.config/fish/completions
 klima completions fish > ~/.config/fish/completions/klima.fish
-klima man ~/.local/share/man/man1                # then `man klima`, `man klima-set`
+klima man ~/.local/share/man/man1
 ```
+
+zsh finds `~/.zfunc` once `fpath=(~/.zfunc $fpath)` comes before `compinit` in `~/.zshrc`. Then
+`man klima` and `man klima-set` work, as do the pages of the other commands.
 
 A command is checked against what the unit supports and what the account may change before
 anything is sent, leaves out settings the unit already has, and goes out as one MELCloud
