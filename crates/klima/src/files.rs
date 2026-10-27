@@ -1,0 +1,124 @@
+//! Private files: owner-only permissions and atomic replacement.
+
+use std::fs::{self, DirBuilder, OpenOptions};
+use std::io::{self, Write};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::path::Path;
+
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+
+use crate::error::AppError;
+
+/// Creates `dir` and its parents, readable only by the owner.
+pub fn private_dir(dir: &Path) -> Result<(), AppError> {
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| AppError::io(dir, e))
+}
+
+fn parent(path: &Path) -> &Path {
+    path.parent().unwrap_or_else(|| Path::new("."))
+}
+
+/// Reads JSON from `path`; `None` when the file does not exist.
+pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, AppError> {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|source| AppError::Corrupt {
+                path: path.to_path_buf(),
+                source,
+            }),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(AppError::io(path, e)),
+    }
+}
+
+/// Replaces `path` with `value` as JSON. Readers see the old or the new file, never half of
+/// one, and the file is readable only by the owner.
+pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
+    let dir = parent(path);
+    private_dir(dir)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let temporary = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let write = || -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        serde_json::to_writer_pretty(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)
+    };
+    write().map_err(|e| {
+        let _ = fs::remove_file(&temporary);
+        AppError::io(path, e)
+    })
+}
+
+/// Appends one JSON line to `path`.
+pub fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
+    private_dir(parent(path))?;
+    let mut line = serde_json::to_vec(value).map_err(|e| AppError::io(path, e.into()))?;
+    line.push(b'\n');
+    OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .open(path)
+        .and_then(|mut file| file.write_all(&line))
+        .map_err(|e| AppError::io(path, e))
+}
+
+/// Deletes `path`; `false` when it did not exist.
+pub fn remove(path: &Path) -> Result<bool, AppError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(AppError::io(path, e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    #[test]
+    fn written_files_are_private_and_read_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested/value.json");
+        write_json(&path, &vec![1, 2, 3]).unwrap();
+
+        assert_eq!(read_json::<Vec<i32>>(&path).unwrap(), Some(vec![1, 2, 3]));
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let dir_mode = fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        let leftovers = fs::read_dir(path.parent().unwrap()).unwrap().count();
+        assert_eq!(leftovers, 1, "temporary file left behind");
+    }
+
+    #[test]
+    fn missing_and_corrupt_files_are_told_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("value.json");
+        assert_eq!(read_json::<i32>(&path).unwrap(), None);
+        fs::write(&path, "{ not json").unwrap();
+        assert!(matches!(
+            read_json::<i32>(&path),
+            Err(AppError::Corrupt { .. })
+        ));
+    }
+}

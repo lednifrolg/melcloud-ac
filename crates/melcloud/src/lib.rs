@@ -25,7 +25,7 @@ pub use ata::{
 pub use caps::{Capabilities, Permissions, TemperatureRange};
 pub use change::{Action, ChangeError, ChangeSet, SetAtaRequest};
 pub use client::{Client, ContextKey, Session};
-pub use devices::{BuildingId, Device, DeviceId, DeviceKind, OWNER_ACCESS_LEVEL};
+pub use devices::{BuildingId, Device, DeviceId, DeviceKind, DeviceList, OWNER_ACCESS_LEVEL};
 pub use error::{Error, LoginError};
 pub use flags::EffectiveFlags;
 

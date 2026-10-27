@@ -8,15 +8,60 @@ and controls a real device on a real account.
 
 ## Status
 
-Early development: the `melcloud` API client crate is in place, the `klima` CLI does not do
-anything yet.
-The API has been verified live for login, device listing, reading unit state and changing the
-target temperature.
+Early development. Logging in, listing devices and reading a unit work; commands and the TUI
+are next. The API has been verified live for login, device listing, reading unit state and
+changing the target temperature.
 
-## Login
+## Usage
 
-`klima login` asks for your email and password. The password is never stored; only the session
-token is kept locally, readable only by you. When the session expires, log in again.
+```sh
+cargo install --path crates/klima
+
+klima login            # asks for email and password; stores only the session
+klima devices          # devices on the account (cached for a day, --fresh to ask again)
+klima status           # unit state (cached for 5 minutes, --fresh to ask again)
+klima status --json    # the same for scripts
+klima logout
+```
+
+With several devices, pick one with `--device <name or ID>` or set it in
+`~/.config/klima/config.toml`:
+
+```toml
+email = "user@example.com"   # offered by `klima login`
+device = "Living room"
+```
+
+`klima login --email <email> --password-stdin` reads the password from standard input, e.g. from
+a password manager. The password is never stored; only the session token is kept, readable only
+by you. When the session expires, log in again.
+
+Files: `~/.config/klima` (config), `~/.local/state/klima` (session, request ledger, history of
+unit states), `~/.cache/klima` (last server responses). `KLIMA_HOME` puts all three in one
+directory.
+
+### Request budget
+
+MELCloud throttles a whole account for hours after too many requests and publishes no limit.
+Every request from every running klima process is counted in one shared ledger:
+
+- at most 30 requests in any hour,
+- at least 60 seconds between two reads of the same unit,
+- after HTTP 429, no requests for 6 hours (`klima unblock` lifts this locally; MELCloud keeps
+  its own limit),
+- after a login lockout, no login attempts until it ends.
+
+When a fresh read is not possible, `klima status` shows the last known state and says why.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| 0 | success |
+| 1 | error talking to MELCloud, or a local file problem |
+| 2 | wrong usage, e.g. an unknown or ambiguous device |
+| 3 | stopped by the request budget, throttling or a login lockout |
+| 4 | not logged in, or the session expired |
 
 ## Using the API responsibly
 
@@ -36,6 +81,9 @@ token is kept locally, readable only by you. When the session expires, log in ag
 Test data in `crates/melcloud/tests/data` is synthetic. Never commit captured server responses,
 credentials, session tokens or real device identifiers. Code, docs and commit messages are in
 English.
+
+The end-to-end tests run the `klima` binary against a mock server; `KLIMA_API_URL` points klima
+at a server other than MELCloud.
 
 The checks CI runs:
 

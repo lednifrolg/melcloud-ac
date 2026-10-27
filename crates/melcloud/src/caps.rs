@@ -135,13 +135,14 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::devices::parse_devices;
+    use crate::devices::DeviceList;
 
     const LIST_DEVICES: &str = include_str!("../tests/data/list-devices.json");
 
     fn capabilities(list: &Value) -> Vec<Capabilities> {
-        parse_devices(list.to_string().as_bytes())
+        serde_json::from_value::<DeviceList>(list.clone())
             .unwrap()
+            .into_devices()
             .into_iter()
             .map(|d| d.capabilities.unwrap())
             .collect()

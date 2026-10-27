@@ -2,7 +2,8 @@
 
 use std::fmt;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 
 use crate::caps::{Capabilities, Permissions};
 
@@ -219,11 +220,59 @@ impl Device {
     }
 }
 
-/// Reads a `User/ListDevices` response: every device on every level of every building.
-pub(crate) fn parse_devices(body: &[u8]) -> Result<Vec<Device>, serde_json::Error> {
-    let buildings: Vec<RawBuilding> = serde_json::from_slice(body)?;
+/// Devices from `User/ListDevices`: every device on every level of every building.
+///
+/// The response is kept exactly as the server sent it, so the list can be stored and read back
+/// without depending on this crate's types.
+#[derive(Clone, PartialEq)]
+pub struct DeviceList {
+    raw: Value,
+    devices: Vec<Device>,
+}
+
+impl DeviceList {
+    pub fn devices(&self) -> &[Device] {
+        &self.devices
+    }
+
+    pub fn into_devices(self) -> Vec<Device> {
+        self.devices
+    }
+
+    /// The response as the server sent it.
+    pub fn raw(&self) -> &Value {
+        &self.raw
+    }
+
+    fn from_raw(raw: Value) -> Result<Self, serde_json::Error> {
+        let devices = devices_in(&Vec::<RawBuilding>::deserialize(&raw)?);
+        Ok(Self { raw, devices })
+    }
+}
+
+impl fmt::Debug for DeviceList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeviceList")
+            .field("devices", &self.devices)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Serialize for DeviceList {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for DeviceList {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::from_raw(Value::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+fn devices_in(buildings: &[RawBuilding]) -> Vec<Device> {
     let mut devices = Vec::new();
-    for building in &buildings {
+    for building in buildings {
         let structure = &building.structure;
         let in_floors = structure.floors.iter().flat_map(|floor| {
             floor
@@ -238,7 +287,7 @@ pub(crate) fn parse_devices(body: &[u8]) -> Result<Vec<Device>, serde_json::Erro
             .chain(in_floors);
         devices.extend(entries.map(|entry| Device::from_raw(entry, building)));
     }
-    Ok(devices)
+    devices
 }
 
 #[cfg(test)]
@@ -249,7 +298,9 @@ mod tests {
 
     #[test]
     fn finds_devices_on_every_level() {
-        let devices = parse_devices(LIST_DEVICES.as_bytes()).unwrap();
+        let devices = serde_json::from_str::<DeviceList>(LIST_DEVICES)
+            .unwrap()
+            .into_devices();
         let names: Vec<_> = devices.iter().map(|d| d.name.as_str()).collect();
         assert_eq!(names, ["Living room", "Bedroom"]);
         assert!(
@@ -262,7 +313,9 @@ mod tests {
 
     #[test]
     fn reads_device_details() {
-        let devices = parse_devices(LIST_DEVICES.as_bytes()).unwrap();
+        let devices = serde_json::from_str::<DeviceList>(LIST_DEVICES)
+            .unwrap()
+            .into_devices();
         let living = &devices[0];
         assert_eq!(living.id, DeviceId(1_000_001));
         assert_eq!(living.kind, DeviceKind::AirToAir);
@@ -281,10 +334,19 @@ mod tests {
     }
 
     #[test]
+    fn list_serializes_back_to_the_response() {
+        let original: Value = serde_json::from_str(LIST_DEVICES).unwrap();
+        let list: DeviceList = serde_json::from_value(original.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&list).unwrap(), original);
+    }
+
+    #[test]
     fn other_device_kinds_have_no_capabilities() {
         let mut value: serde_json::Value = serde_json::from_str(LIST_DEVICES).unwrap();
         value[0]["Structure"]["Devices"][0]["Device"] = serde_json::json!({ "DeviceType": 1 });
-        let devices = parse_devices(value.to_string().as_bytes()).unwrap();
+        let devices = serde_json::from_value::<DeviceList>(value)
+            .unwrap()
+            .into_devices();
         assert_eq!(devices[0].kind, DeviceKind::AirToWater);
         assert_eq!(devices[0].capabilities, None);
     }

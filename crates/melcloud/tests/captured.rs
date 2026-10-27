@@ -43,7 +43,7 @@ async fn captured_responses_are_readable() {
         .unwrap();
     assert!(session.expires_at().is_some());
 
-    let devices = client.devices(&session).await.unwrap();
+    let devices = client.devices(&session).await.unwrap().into_devices();
     for device in &devices {
         assert_eq!(
             device.capabilities.is_some(),
