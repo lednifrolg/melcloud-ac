@@ -1,8 +1,8 @@
 name: Release
 
 # A tag v* on main builds the archives and publishes them as a GitHub release. A pull request
-# that changes the code, the dependencies or this workflow builds them without publishing, so a
-# release does not fail first on its tag. No caches: what is published is built from the tagged
+# that changes what goes into them builds them without publishing, so a release does not fail
+# first on its tag. No caches: what is published is built from the tagged
 # source alone.
 on:
   push:
@@ -13,6 +13,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "crates/**"
+      - "README.md"
+      - "LICENSE-*"
 
 permissions:
   contents: read
