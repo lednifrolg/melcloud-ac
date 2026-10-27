@@ -5,7 +5,7 @@ use std::str::FromStr;
 
 use jiff::Timestamp;
 use jiff::civil::DateTime;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Map, Value};
 
 use crate::devices::DeviceId;
@@ -478,6 +478,12 @@ impl fmt::Debug for AtaState {
     }
 }
 
+impl Serialize for AtaState {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
 impl<'de> Deserialize<'de> for AtaState {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = Map::deserialize(deserializer)?;
@@ -522,6 +528,12 @@ mod tests {
     fn raw_keeps_every_field() {
         let original: Map<String, Value> = serde_json::from_str(DEVICE_GET).unwrap();
         assert_eq!(state().raw(), &original);
+    }
+
+    #[test]
+    fn state_serializes_back_to_the_response() {
+        let original: Value = serde_json::from_str(DEVICE_GET).unwrap();
+        assert_eq!(serde_json::to_value(state()).unwrap(), original);
     }
 
     #[test]

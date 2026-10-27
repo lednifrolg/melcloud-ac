@@ -192,8 +192,8 @@ async fn devices_are_read_with_the_session_key() {
         .mount(&server)
         .await;
 
-    let devices = client(&server).devices(&session()).await.unwrap();
-    let names: Vec<_> = devices.iter().map(|d| d.name.as_str()).collect();
+    let list = client(&server).devices(&session()).await.unwrap();
+    let names: Vec<_> = list.devices().iter().map(|d| d.name.as_str()).collect();
     assert_eq!(names, ["Living room", "Bedroom"]);
 }
 
@@ -242,7 +242,12 @@ async fn command_sends_the_state_with_changes() {
         .await;
 
     let client = client(&server);
-    let device = client.devices(&session()).await.unwrap().remove(0);
+    let device = client
+        .devices(&session())
+        .await
+        .unwrap()
+        .into_devices()
+        .remove(0);
     let state = client
         .ata_state(&session(), device.id, device.building_id)
         .await

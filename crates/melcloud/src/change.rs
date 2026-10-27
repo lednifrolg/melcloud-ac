@@ -247,13 +247,15 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::devices::parse_devices;
+    use crate::devices::DeviceList;
 
     const LIST_DEVICES: &str = include_str!("../tests/data/list-devices.json");
     const DEVICE_GET: &str = include_str!("../tests/data/device-get.json");
 
     fn devices() -> Vec<Device> {
-        parse_devices(LIST_DEVICES.as_bytes()).unwrap()
+        serde_json::from_str::<DeviceList>(LIST_DEVICES)
+            .unwrap()
+            .into_devices()
     }
 
     fn owner() -> Device {

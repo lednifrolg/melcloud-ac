@@ -13,7 +13,7 @@ use serde_json::json;
 
 use crate::ata::AtaState;
 use crate::change::SetAtaRequest;
-use crate::devices::{BuildingId, Device, DeviceId, parse_devices};
+use crate::devices::{BuildingId, DeviceId, DeviceList};
 use crate::error::{Error, LoginError};
 use crate::time::utc;
 use crate::{APP_VERSION, BASE_URL};
@@ -181,13 +181,9 @@ impl Client {
     }
 
     /// Every device on the account (`User/ListDevices`).
-    pub async fn devices(&self, session: &Session) -> Result<Vec<Device>, Error> {
+    pub async fn devices(&self, session: &Session) -> Result<DeviceList, Error> {
         let request = authorized(self.http.get(self.url(LIST_DEVICES)), session);
-        let body = self.send(request).await?;
-        parse_devices(&body).map_err(|source| Error::Decode {
-            endpoint: LIST_DEVICES,
-            source,
-        })
+        self.call(LIST_DEVICES, request).await
     }
 
     /// Current state of an air-to-air unit (`Device/Get`).
