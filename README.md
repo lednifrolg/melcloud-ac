@@ -31,6 +31,7 @@ latest=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/ledni
 tag=${latest##*/}
 cd "$(mktemp -d)"
 url="https://github.com/lednifrolg/melcloud-ac/releases/download/$tag"
+[ "$target" != none ] &&
 curl -fsSLO "$url/klima-$target.tar.gz" &&
 curl -fsSLO "$url/SHA256SUMS" &&
 grep " klima-$target.tar.gz\$" SHA256SUMS > checksum &&
@@ -54,14 +55,25 @@ Then, in the same terminal, this installs it into `~/.local/bin`:
 tar -xzf "klima-$target.tar.gz" &&
 mkdir -p ~/.local/bin &&
 install -m 755 "klima-$target/klima" ~/.local/bin/ &&
-klima --version
+~/.local/bin/klima --version &&
+type klima
 ```
 
-If the last line says the command is not found, add `export PATH="$HOME/.local/bin:$PATH"` to
-`~/.zshrc` or `~/.bashrc` and open a new terminal. The same commands update klima. Other systems,
-like a 32-bit Raspberry Pi, build from source (below). The archive also holds shell completions
-in `completions/` and man pages in `man/man1/`, the same files `klima completions` and
-`klima man` write (see [Usage](#usage)).
+The last line should say `klima is` followed by the path in `~/.local/bin`. If klima is not
+found, add `export PATH="$HOME/.local/bin:$PATH"` to `~/.zshrc` or `~/.bashrc` and open a new
+terminal. If it names another file, an older klima comes first on PATH; remove it, with
+`cargo uninstall klima` for one built from source. The same commands update klima. Other
+systems, like a 32-bit Raspberry Pi, build from source (below). The archive also holds shell
+completions in `completions/` and man pages in `man/man1/`, the same files `klima completions`
+and `klima man` write (see [Usage](#usage)).
+
+The installed binary is attested as well, so it can be checked later from any terminal:
+
+```sh
+gh attestation verify ~/.local/bin/klima --repo lednifrolg/melcloud-ac \
+  --cert-identity "https://github.com/lednifrolg/melcloud-ac/.github/workflows/release.yml@refs/tags/v$(~/.local/bin/klima --version | cut -d ' ' -f 2)" \
+  --deny-self-hosted-runners
+```
 
 On macOS, a binary downloaded with a browser instead is quarantined and refused as unverified;
 `xattr -d com.apple.quarantine ~/.local/bin/klima` lifts that.
@@ -89,21 +101,36 @@ klima set --power on --mode heat --temp 21 --fan auto   # several changes, one c
 klima logout
 ```
 
-Shell completions and man pages come from the binary itself, for bash, zsh, fish, elvish and
-PowerShell:
+Shell completions and man pages come from the binary itself; run the line for your shell, and
+again after updating klima. For bash, with the bash-completion package installed:
 
 ```sh
-mkdir -p ~/.local/share/bash-completion/completions
-klima completions bash > ~/.local/share/bash-completion/completions/klima
-mkdir -p ~/.zfunc
-klima completions zsh > ~/.zfunc/_klima
-mkdir -p ~/.config/fish/completions
-klima completions fish > ~/.config/fish/completions/klima.fish
+mkdir -p ~/.local/share/bash-completion/completions && klima completions bash > ~/.local/share/bash-completion/completions/klima
+```
+
+For zsh:
+
+```sh
+mkdir -p ~/.zfunc && klima completions zsh > ~/.zfunc/_klima
+```
+
+and in `~/.zshrc`, `fpath=(~/.zfunc $fpath)` before `compinit` runs (with oh-my-zsh, before
+`source $ZSH/oh-my-zsh.sh`). A `~/.zshrc` with neither, as on a fresh macOS, needs
+`fpath=(~/.zfunc $fpath); autoload -Uz compinit && compinit`. For fish:
+
+```sh
+mkdir -p ~/.config/fish/completions && klima completions fish > ~/.config/fish/completions/klima.fish
+```
+
+elvish and PowerShell work the same way. The man pages, for `man klima`, `man klima-set` and the
+other commands:
+
+```sh
 klima man ~/.local/share/man/man1
 ```
 
-zsh finds `~/.zfunc` once `fpath=(~/.zfunc $fpath)` comes before `compinit` in `~/.zshrc`. Then
-`man klima` and `man klima-set` work, as do the pages of the other commands.
+man finds them while `~/.local/bin` is on PATH; otherwise `export MANPATH="$HOME/.local/share/man:"`
+in the shell's startup file helps.
 
 A command is checked against what the unit supports and what the account may change before
 anything is sent, leaves out settings the unit already has, and goes out as one MELCloud

@@ -137,11 +137,16 @@ jobs:
       - name: Checksums
         working-directory: dist
         run: sha256sum klima-*.tar.gz > SHA256SUMS
+      # The binaries are attested too, so an installed klima can be checked on its own.
+      - name: Unpack the binaries
+        working-directory: dist
+        run: for archive in klima-*.tar.gz; do tar -xzf "$archive"; done
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
             dist/klima-*.tar.gz
             dist/SHA256SUMS
+            dist/klima-*/klima
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
