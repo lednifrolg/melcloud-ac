@@ -3,6 +3,8 @@
 Terminal client for Mitsubishi Electric air conditioners on the classic MELCloud service
 (`app.melcloud.com`): one-shot commands for the shell and an interactive TUI.
 
+![The TUI: the target raised and the mode changed, each confirmed by the unit; then the history in the shell](assets/demo.gif)
+
 Unofficial project, not affiliated with Mitsubishi Electric. It talks to an undocumented API
 and controls a real device on a real account.
 
@@ -174,6 +176,10 @@ control pane shows the countdown, the wait for the adapter and the result. `⏎`
 a narrow window the panes become tabs (`Tab`, `1`-`4`). Colors come from the terminal's palette,
 so the TUI follows the terminal theme.
 
+| The dashboard | History in a narrow window | In the shell |
+|---|---|---|
+| ![The dashboard after switching to cool](assets/dashboard.png) | ![The history tab](assets/history.png) | ![klima status and klima history](assets/cli.png) |
+
 `klima login --email <email> --password-stdin` reads the password from standard input, e.g. from
 a password manager. The password is never stored; only the session token is kept, readable only
 by you. When the session expires, log in again.
@@ -181,6 +187,52 @@ by you. When the session expires, log in again.
 Files: `~/.config/klima` (config), `~/.local/state/klima` (session, request ledger, history of
 unit states), `~/.cache/klima` (last server responses). `KLIMA_HOME` puts all three in one
 directory.
+
+### Hyprland
+
+One-shot commands suit key bindings. `--no-wait` returns once MELCloud has the command,
+without spending further requests on checking it; the TUI or `klima status` shows the result.
+With Hyprland's Lua configuration, in `~/.config/hypr/hyprland.lua`:
+
+```lua
+local function klima(args)
+  return hl.dsp.exec_cmd("klima " .. args)
+end
+hl.bind("SUPER + CTRL + ALT + A", klima("toggle --no-wait"), { description = "Air conditioner on or off" })
+hl.bind("SUPER + CTRL + ALT + UP", klima("temp +0.5 --no-wait"), { description = "Air conditioner warmer" })
+hl.bind("SUPER + CTRL + ALT + DOWN", klima("temp -0.5 --no-wait"), { description = "Air conditioner cooler" })
+hl.bind("SUPER + CTRL + ALT + K", hl.dsp.exec_cmd("kitty --class klima klima"), { description = "Air conditioner" })
+hl.window_rule({ match = { class = "^klima$" }, float = true, center = true, size = { 1100, 720 } })
+```
+
+The last binding opens the TUI in a terminal with the class `klima`, which the window rule
+floats; with Alacritty that is `alacritty --class klima -e klima`, with foot
+`foot --app-id klima klima`. On Omarchy, `~/.config/hypr/bindings.lua` has the helpers for the
+same, and its own launcher for TUIs:
+
+```lua
+o.bind("SUPER + CTRL + ALT + A", "Air conditioner on or off", "klima toggle --no-wait")
+o.bind("SUPER + CTRL + ALT + UP", "Air conditioner warmer", "klima temp +0.5 --no-wait")
+o.bind("SUPER + CTRL + ALT + DOWN", "Air conditioner cooler", "klima temp -0.5 --no-wait")
+o.bind("SUPER + CTRL + ALT + K", "Air conditioner", "omarchy-launch-or-focus-tui klima")
+o.window("org.omarchy.klima", { float = true, center = true, size = { 1100, 720 } })
+```
+
+With the classic `hyprland.conf`:
+
+```ini
+bind = SUPER CTRL ALT, A, exec, klima toggle --no-wait
+bind = SUPER CTRL ALT, UP, exec, klima temp +0.5 --no-wait
+bind = SUPER CTRL ALT, DOWN, exec, klima temp -0.5 --no-wait
+bind = SUPER CTRL ALT, K, exec, kitty --class klima klima
+```
+
+A window rule for the class `klima`, in the syntax of the Hyprland version at hand, floats the
+TUI there.
+
+To see what a binding did, send the output as a notification, for example
+`sh -c 'notify-send klima "$(klima toggle --no-wait 2>&1)"'`. Every press is a command to
+MELCloud and counts against the request budget below.
 
 ### Request budget
 
@@ -228,6 +280,20 @@ English.
 
 The end-to-end tests run the `klima` binary against a mock server; `KLIMA_API_URL` points klima
 at a server other than MELCloud.
+
+The demo at the top and the screenshots come from `assets/demo.tape` and `assets/narrow.tape`,
+recorded with [vhs](https://github.com/charmbracelet/vhs) against a stand-in for MELCloud
+(`crates/klima/examples/demo_server.rs`), so they send nothing to the real service. vhs misses
+the TUI's alternate screen in its own screenshots, so they are frames of the recordings:
+
+```sh
+cargo build -p klima --examples
+vhs assets/demo.tape
+vhs assets/narrow.tape
+ffmpeg -ss 17 -i assets/demo.mp4 -frames:v 1 -y assets/dashboard.png
+ffmpeg -ss 3 -i assets/narrow.mp4 -frames:v 1 -y assets/history.png
+ffmpeg -ss 25 -i assets/demo.mp4 -frames:v 1 -vf crop=iw:450:0:0 -y assets/cli.png
+```
 
 The checks CI runs:
 

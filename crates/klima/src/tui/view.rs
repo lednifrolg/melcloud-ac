@@ -48,7 +48,7 @@ const FLASHED: Style = Style::new()
     .fg(Color::Indexed(15))
     .add_modifier(Modifier::BOLD);
 /// A turning fan.
-const FAN: [char; 6] = ['◜', '◠', '◝', '◞', '◡', '◟'];
+const FAN: [char; 4] = ['◐', '◓', '◑', '◒'];
 /// Time a swinging vane takes from one position to the next.
 const SWING_STEP: i64 = 250;
 
@@ -111,13 +111,29 @@ pub fn render(model: &Model, frame: &mut Frame) -> Vec<Hotspot> {
     Vec::new()
 }
 
+/// Height of the control pane with every setting and the command status, and the least the
+/// history under it gets; the history takes what a taller window adds.
+const CONTROL_HEIGHT: u16 = 18;
+const HISTORY_MIN: u16 = 9;
+/// Height of the unit pane.
+const UNIT_HEIGHT: u16 = 7;
+
+/// Control and history on the left; weather, unit and activity on the right, the activity
+/// taking what the other two leave.
 fn wide(model: &Model, frame: &mut Frame, body: Rect, spots: &mut Vec<Hotspot>) {
-    let [top, bottom] = Layout::vertical([Constraint::Fill(1), Constraint::Length(9)]).areas(body);
-    let columns = || Layout::horizontal([Constraint::Fill(7), Constraint::Fill(4)]).spacing(1);
-    let [control_area, side] = columns().areas(top);
-    let [outside_area, unit_area] =
-        Layout::vertical([Constraint::Fill(1), Constraint::Length(7)]).areas(side);
-    let [history_area, activity_area] = columns().areas(bottom);
+    let [left, right] = Layout::horizontal([Constraint::Fill(7), Constraint::Fill(4)])
+        .spacing(1)
+        .areas(body);
+    let top = body.height.saturating_sub(HISTORY_MIN).min(CONTROL_HEIGHT);
+    let [control_area, history_area] =
+        Layout::vertical([Constraint::Length(top), Constraint::Fill(1)]).areas(left);
+    let weather = u16::try_from(outside_lines(model).len()).unwrap_or(u16::MAX);
+    let [outside_area, unit_area, activity_area] = Layout::vertical([
+        Constraint::Length(weather.saturating_add(2)),
+        Constraint::Length(UNIT_HEIGHT),
+        Constraint::Fill(1),
+    ])
+    .areas(right);
     control(model, frame, control_area, spots);
     outside(model, frame, outside_area);
     unit(model, frame, unit_area);
@@ -140,7 +156,8 @@ fn tabs(model: &Model, frame: &mut Frame, body: Rect, spots: &mut Vec<Hotspot>) 
         0 => control(model, frame, pane, spots),
         1 => {
             let [outside_area, unit_area] =
-                Layout::vertical([Constraint::Fill(1), Constraint::Length(7)]).areas(pane);
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(UNIT_HEIGHT)])
+                    .areas(pane);
             outside(model, frame, outside_area);
             unit(model, frame, unit_area);
         }
@@ -628,6 +645,11 @@ fn condition(name: &str) -> String {
 
 fn outside(model: &Model, frame: &mut Frame, area: Rect) {
     let block = pane(title("Outside"), MUTED).title_top(dim_title("MELCloud weather"));
+    frame.render_widget(Paragraph::new(outside_lines(model)).block(block), area);
+}
+
+/// The weather at the building: the forecast, then sunrise and sunset.
+fn outside_lines(model: &Model) -> Vec<Line<'static>> {
     let weather = model
         .state
         .as_ref()
@@ -665,7 +687,7 @@ fn outside(model: &Model, frame: &mut Frame, area: Rect) {
     if lines.is_empty() {
         lines.push(Line::styled("no weather data", DIM));
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    lines
 }
 
 fn wifi_bars(dbm: i32) -> Vec<Span<'static>> {
@@ -1454,9 +1476,9 @@ mod tests {
                 })
                 .collect::<String>()
         };
-        assert_eq!(glyphs(FanSpeed::Level(5), 125), "◜◠◝◞◡◟◜◠");
-        assert_eq!(glyphs(FanSpeed::Level(1), 625), "◜◠◝◞◡◟◜◠");
-        assert_eq!(glyphs(FanSpeed::Level(1), 125), "◜◜◜◜◜◠◠◠");
+        assert_eq!(glyphs(FanSpeed::Level(5), 125), "◐◓◑◒◐◓◑◒");
+        assert_eq!(glyphs(FanSpeed::Level(1), 625), "◐◓◑◒◐◓◑◒");
+        assert_eq!(glyphs(FanSpeed::Level(1), 125), "◐◐◐◐◐◓◓◓");
         assert_eq!(glyphs(FanSpeed::Auto, 375), glyphs(FanSpeed::Level(3), 375));
     }
 
