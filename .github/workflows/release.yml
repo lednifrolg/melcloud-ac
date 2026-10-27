@@ -17,6 +17,11 @@ on:
 permissions:
   contents: read
 
+# One run per tag at a time; a pull request's newer push replaces its older run.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   # The same compiler for every archive of a release; raised on purpose.
@@ -116,13 +121,9 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
-      - name: Check the tag is on main and was not moved
+      # The checkout itself fails when the tag was moved during the build.
+      - name: Check the tag is on main
         run: |
-          tagged=$(git rev-parse "refs/tags/$GITHUB_REF_NAME^{commit}")
-          if [ "$tagged" != "$GITHUB_SHA" ]; then
-            echo "::error::$GITHUB_REF_NAME moved from $GITHUB_SHA to $tagged during the build"
-            exit 1
-          fi
           if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
             echo "::error::$GITHUB_REF_NAME is not on main"
             exit 1
@@ -149,13 +150,9 @@ jobs:
           if [[ "$GITHUB_REF_NAME" == *-* ]]; then
             flags=(--prerelease --latest=false)
           fi
-          # A release made by hand for the tag, or left by an interrupted run, gets the files.
-          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" "${files[@]}" --repo "$GITHUB_REPOSITORY" --clobber
-          else
-            gh release create "$GITHUB_REF_NAME" "${files[@]}" "${flags[@]}" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "klima $GITHUB_REF_NAME" \
-              --verify-tag \
-              --generate-notes
-          fi
+          # Fails when the tag already has a release: published files are never replaced.
+          gh release create "$GITHUB_REF_NAME" "${files[@]}" "${flags[@]}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "klima $GITHUB_REF_NAME" \
+            --verify-tag \
+            --generate-notes
