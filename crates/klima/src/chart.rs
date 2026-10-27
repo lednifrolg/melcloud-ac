@@ -10,8 +10,8 @@ use crate::cache::Sample;
 pub const GAP: SignedDuration = SignedDuration::from_mins(45);
 
 /// Minutes between time labels: the shortest step that leaves about a dozen columns per label.
-const LABEL_MINUTES: [i64; 14] = [
-    5, 10, 15, 30, 60, 120, 180, 360, 720, 1440, 2880, 10_080, 20_160, 43_200,
+const LABEL_MINUTES: [i64; 16] = [
+    1, 2, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1440, 2880, 10_080, 20_160, 43_200,
 ];
 const COLUMNS_PER_LABEL: usize = 12;
 const DAY_MINUTES: i64 = 1440;

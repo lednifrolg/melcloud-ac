@@ -389,7 +389,17 @@ async fn old_state_is_shown_with_the_reason_it_was_not_refreshed() {
         "{text}"
     );
     assert!(text.contains("updated 20 min ago · cached"), "{text}");
-    assert!(stderr(&output).contains("HTTP 500"), "{}", stderr(&output));
+    assert_eq!(stderr(&output), "", "the reason is not repeated");
+
+    // Moments later the read is refused for spacing, but the state is still the old one.
+    let again = klima.run(&[&LIVING_ROOM[..], &["status"]].concat()).await;
+    assert_eq!(code(&again), 3);
+    let text = stdout(&again);
+    assert!(
+        text.contains("! not refreshed: the unit was asked moments ago; next read possible in"),
+        "{text}"
+    );
+    assert_eq!(klima.requests_to("/Device/Get").await, 1);
 }
 
 /// Writes history lines for the living room, `minutes` ago each, with `power` and `mode`.

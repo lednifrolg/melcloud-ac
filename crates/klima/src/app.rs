@@ -138,8 +138,13 @@ impl App {
         check_device(device, &state)?;
         let now = Timestamp::now();
         cache::store(&self.paths.state_of(device.id), &state, now)?;
-        // The history is a convenience: a read that worked stays a success without it.
-        let _ = cache::record_history(&self.paths, state.view(), now);
+        // MELCloud's clock keeps a local clock far ahead from making the whole history look
+        // old. The history is a convenience: a read that worked stays a success without it.
+        let reference = self
+            .client
+            .server_time()
+            .map_or(now, |server| now.min(server));
+        let _ = cache::record_history(&self.paths, state.view(), now, reference);
         Ok(Cached {
             fetched_at: now,
             value: state,

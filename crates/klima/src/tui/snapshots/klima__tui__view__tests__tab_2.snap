@@ -3,7 +3,7 @@ source: crates/klima/src/tui/view.rs
 expression: "screen(&model, 64, 22)"
 ---
 " 1 control  2 info  3 history  4 activity                       "
-"╭ History · 24 h ────────────────────────────────── 86 samples ╮"
+"╭ History · 24h ─────────────────────────────────── 86 samples ╮"
 "│ 23.4°  ⢢                                                   ⡄ │"
 "│         ⠑⢄⡀                                              ⡠⠊  │"
 "│           ⠈⢆                                           ⡰⠉    │"

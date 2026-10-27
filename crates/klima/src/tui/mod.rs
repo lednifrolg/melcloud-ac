@@ -124,6 +124,8 @@ fn start(app: &App) -> Result<Start, AppError> {
         account,
         email,
         animations: app.config.animations(),
+        // https://no-color.org: set and not empty.
+        colors: std::env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
     })
 }
 
@@ -299,15 +301,28 @@ async fn send(app: &App, device: &Device, changes: ChangeSet, report: impl Fn(Ms
 async fn load_devices(
     app: &App,
 ) -> Result<(Cached<DeviceList>, Option<Cached<AtaState>>), AppError> {
-    // Without MELCloud, the list from before will do: devices rarely change.
+    // When MELCloud cannot be reached, the list from before will do: devices rarely change.
+    // Other failures, like an expired session, are for the user to see.
     let list = match app.devices(false).await {
         Ok(list) => list,
-        Err(error) => cache::load::<DeviceList>(&app.paths.devices()).ok_or(error)?,
+        Err(error) if unanswered(&error) => {
+            cache::load::<DeviceList>(&app.paths.devices()).ok_or(error)?
+        }
+        Err(error) => return Err(error),
     };
     let devices = list.value.devices();
     let state = model::choose(devices, app.config.device.as_deref())
         .and_then(|index| cache::load(&app.paths.state_of(devices[index].id)));
     Ok((list, state))
+}
+
+/// MELCloud could not be reached, or failed: network, timeout, HTTP 5xx.
+fn unanswered(error: &AppError) -> bool {
+    match error {
+        AppError::Api(melcloud::Error::Transport(_)) => true,
+        AppError::Api(melcloud::Error::Status { status, .. }) => *status >= 500,
+        _ => false,
+    }
 }
 
 fn failure(error: &AppError) -> Failure {
@@ -328,13 +343,8 @@ fn failure(error: &AppError) -> Failure {
         | AppError::LoginLocked { until } => Some(*until),
         _ => None,
     };
-    let unanswered = match error {
-        AppError::Api(melcloud::Error::Transport(_)) => true,
-        AppError::Api(melcloud::Error::Status { status, .. }) => *status >= 500,
-        _ => false,
-    };
     let reached = match error {
-        _ if unanswered => Some(false),
+        _ if unanswered(error) => Some(false),
         AppError::Usage(_)
         | AppError::Config { .. }
         | AppError::Invalid(_)
@@ -344,20 +354,9 @@ fn failure(error: &AppError) -> Failure {
         | AppError::Corrupt { .. } => None,
         _ => Some(true),
     };
-    // The activity log has room for the cause, not for the request's URL.
-    let message = match error {
-        AppError::Api(melcloud::Error::Transport(e)) => {
-            let mut cause: &dyn std::error::Error = e;
-            while let Some(inner) = cause.source() {
-                cause = inner;
-            }
-            format!("could not reach MELCloud: {cause}")
-        }
-        _ => output::message(error),
-    };
     Failure {
         kind,
-        message,
+        message: output::message(error),
         retry_at,
         reached,
     }

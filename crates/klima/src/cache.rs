@@ -126,9 +126,15 @@ fn stored_mode(text: &str) -> OperationMode {
     })
 }
 
-/// Adds a state read from the server to the history used for charts, after dropping what is no
-/// longer kept.
-pub fn record_history(paths: &Paths, view: &AtaView, now: Timestamp) -> Result<(), AppError> {
+/// Adds a state read from the server at `now` to the history used for charts, after dropping
+/// what is older than [`HISTORY_KEPT`] before `reference`: a time that does not depend on the
+/// local clock being right, where there is one.
+pub fn record_history(
+    paths: &Paths,
+    view: &AtaView,
+    now: Timestamp,
+    reference: Timestamp,
+) -> Result<(), AppError> {
     let record = Record {
         at: now,
         device: view.device_id,
@@ -145,11 +151,6 @@ pub fn record_history(paths: &Paths, view: &AtaView, now: Timestamp) -> Result<(
         error_code: view.error_code,
         error_message: view.error_message.as_deref(),
     };
-    // The unit's last contact comes from MELCloud's clock, so a local clock far ahead does not
-    // make the whole history look too old.
-    let reference = view.last_communication.map_or(now, |contact| {
-        now.min(contact + SignedDuration::from_hours(24))
-    });
     let _lock = files::lock(&paths.history_lock())?;
     let pruned = prune_history(&paths.history(), reference);
     append_json_line(&paths.history(), &record)?;
@@ -302,10 +303,11 @@ mod tests {
         std::fs::create_dir_all(paths.history().parent().unwrap()).unwrap();
         std::fs::write(paths.history(), &lines).unwrap();
 
-        // Two reads, as a TUI makes them, with the clock 200 days ahead.
+        // Two reads, as a TUI makes them, with the clock 200 days ahead of MELCloud's.
         let wrong = contact + SignedDuration::from_hours(24 * 200);
-        record_history(&paths, state.view(), wrong).unwrap();
-        record_history(&paths, state.view(), wrong + SignedDuration::from_mins(10)).unwrap();
+        let later = SignedDuration::from_mins(10);
+        record_history(&paths, state.view(), wrong, contact).unwrap();
+        record_history(&paths, state.view(), wrong + later, contact + later).unwrap();
         let text = std::fs::read_to_string(paths.history()).unwrap();
         assert!(text.starts_with(&lines), "{text}");
         assert_eq!(text.lines().count(), 4);

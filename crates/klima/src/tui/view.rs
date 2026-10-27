@@ -28,7 +28,7 @@ use crate::cache::Sample;
 use crate::chart::{Column, GAP, Timeline};
 use crate::control;
 use crate::governor::HOURLY_LIMIT;
-use crate::output::{ago, duration};
+use crate::output::{ago, duration, shorten};
 use crate::theme;
 
 const DIM: Style = Style::new().add_modifier(Modifier::DIM);
@@ -196,27 +196,51 @@ fn control(model: &Model, frame: &mut Frame, area: Rect, spots: &mut Vec<Hotspot
     } else {
         Span::styled("○ off", DIM)
     };
+    // A long name is cut, so the power and the model still fit on the border.
+    let model_name = device.and_then(|d| d.model.clone());
+    let room = usize::from(area.width)
+        .saturating_sub(4 + power.width() + 2)
+        .saturating_sub(model_name.as_ref().map_or(0, |m| m.chars().count() + 3));
     let heading = Line::from(vec![
         " ".into(),
-        Span::styled(name, tone.add_modifier(Modifier::BOLD)),
+        Span::styled(
+            shorten(name, room.max(1)),
+            tone.add_modifier(Modifier::BOLD),
+        ),
         " ".into(),
         power,
         " ".into(),
     ]);
     let mut block = pane(heading, color.unwrap_or(MUTED));
-    if let Some(model_name) = device.and_then(|d| d.model.clone()) {
+    if let Some(model_name) = model_name {
         block = block.title_top(dim_title(&model_name));
     }
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // The settings come before the command status, and both before the spacing: a setting that
+    // can be selected must be on screen.
+    let settings = device
+        .and_then(|d| d.capabilities.as_ref())
+        .map_or(0, |caps| {
+            u16::try_from(rows(caps).len()).unwrap_or(u16::MAX)
+        });
+    let mut spare = inner.height.saturating_sub(BIG_TEXT_HEIGHT + 2);
+    let mut take = |wanted: u16| {
+        let given = wanted.min(spare);
+        spare -= given;
+        given
+    };
+    let settings = take(settings);
+    let status = take(2);
+    let gaps = [take(1), take(1)];
     let [digits_row, _, scale_rows, _, rows_area, status_area] = Layout::vertical([
         Constraint::Length(BIG_TEXT_HEIGHT),
-        Constraint::Length(1),
+        Constraint::Length(gaps[0]),
         Constraint::Length(2),
-        Constraint::Length(1),
-        Constraint::Fill(1),
-        Constraint::Length(2),
+        Constraint::Length(gaps[1]),
+        Constraint::Min(settings),
+        Constraint::Length(status),
     ])
     .areas(inner);
     let flashing = model.flash_until.is_some_and(|until| until > model.now);
@@ -240,13 +264,33 @@ fn control(model: &Model, frame: &mut Frame, area: Rect, spots: &mut Vec<Hotspot
         DIM,
     );
     frame.render_widget(line, scale_line);
-    let legend = format!(
-        "   ● target  ┃ room · {} {}-{} · step {}",
-        view.mode, range.min, range.max, caps.temperature_step
-    );
+    let parts = [
+        "   ● target  ┃ room".to_owned(),
+        format!("{} {}-{}", view.mode, range.min, range.max),
+        format!("step {}", caps.temperature_step),
+    ];
+    let legend = joined(parts, usize::from(legend_line.width));
     frame.render_widget(Line::styled(legend, DIM), legend_line);
     control_rows(model, &view, caps, color, frame, rows_area, spots);
     command_status(model, frame, status_area);
+}
+
+/// `parts` joined by " · " as far as they fit in `width`; the parts that do not fit are left
+/// out from the end, never cut.
+fn joined(parts: impl IntoIterator<Item = String>, width: usize) -> String {
+    let mut text = String::new();
+    for part in parts {
+        let next = if text.is_empty() {
+            part
+        } else {
+            format!("{text} · {part}")
+        };
+        if next.chars().count() > width {
+            break;
+        }
+        text = next;
+    }
+    text
 }
 
 /// The target in big digits, with the room and outside temperature beside it.
@@ -328,9 +372,13 @@ fn control_rows(
 ) {
     let selected = model.row;
     let moving = model.moving();
+    // When not every setting fits, the list scrolls so the selected one shows.
+    let all = rows(caps);
+    let index = all.iter().position(|&row| row == selected).unwrap_or(0);
+    let first = index.saturating_sub(usize::from(area.height).saturating_sub(1));
     let tone = color.map_or(DIM, |c| Style::new().fg(c));
     let mut specific = Vec::new();
-    for (row, y) in rows(caps).into_iter().zip(area.y..area.bottom()) {
+    for (row, y) in all.into_iter().skip(first).zip(area.y..area.bottom()) {
         let x = area.x + MARKER + LABEL;
         let spans = match row {
             Row::Temperature => vec![
@@ -718,7 +766,7 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
         .filter(|s| s.at >= since)
         .copied()
         .collect();
-    let mut block = pane(title("History · 24 h"), MUTED);
+    let mut block = pane(title("History · 24h"), MUTED);
     match samples.len() {
         0 => {}
         1 => block = block.title_top(dim_title("1 sample")),
@@ -736,11 +784,17 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
         return;
     }
     // The legend sits on the border, away from the values on the left that it could be read as.
+    // Without colors, the target is drawn in dots instead of a line.
+    let (target_marker, target_mark) = if model.colors {
+        (Marker::Braille, "━")
+    } else {
+        (Marker::Dot, "•")
+    };
     let mut legend = vec![" ".into(), Span::styled("━ room", Style::new().fg(ROOM))];
     if samples.iter().any(|s| s.power) {
         legend.extend([
             "  ".into(),
-            Span::styled("━ target", Style::new().fg(TARGET)),
+            Span::styled(format!("{target_mark} target"), Style::new().fg(TARGET)),
         ]);
     }
     legend.push(" ".into());
@@ -791,12 +845,12 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
     // The room line is drawn last, so it stays on top where the two meet.
     let lines = targets
         .iter()
-        .map(|points| (points, TARGET))
-        .chain(rooms.iter().map(|points| (points, ROOM)));
+        .map(|points| (points, TARGET, target_marker))
+        .chain(rooms.iter().map(|points| (points, ROOM, Marker::Braille)));
     let datasets = lines
-        .map(|(points, color)| {
+        .map(|(points, color, marker)| {
             Dataset::default()
-                .marker(Marker::Braille)
+                .marker(marker)
                 .graph_type(GraphType::Line)
                 .style(Style::new().fg(color))
                 .data(points)
@@ -810,7 +864,7 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
         .y_axis(Axis::default().bounds([low - margin, high + margin]))
         .legend_position(None);
     frame.render_widget(chart, plot);
-    frame.render_widget(mode_ribbon(&timeline, &model.history), ribbon);
+    frame.render_widget(mode_ribbon(&timeline, &model.history, model.colors), ribbon);
     frame.render_widget(Line::styled(timeline.axis(&model.tz), DIM), axis);
 }
 
@@ -841,12 +895,16 @@ fn segments(
 }
 
 /// One cell per column of the chart: the mode the unit ran in, a dot while it was off, nothing
-/// while it was not read.
-fn mode_ribbon(timeline: &Timeline, samples: &[Sample]) -> Line<'static> {
+/// while it was not read. Without colors, the mode's first letter.
+fn mode_ribbon(timeline: &Timeline, samples: &[Sample], colors: bool) -> Line<'static> {
     let cells = timeline
         .columns(samples)
         .into_iter()
         .map(|column| match column {
+            Some(Column {
+                running: Some(mode),
+                ..
+            }) if !colors => mode.to_string().chars().take(1).collect::<String>().into(),
             Some(Column {
                 running: Some(mode),
                 ..
@@ -926,7 +984,9 @@ fn activity(model: &Model, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
-/// A device name in the status line is cut no shorter than this, with "…".
+/// A device name in the status line is cut with "…" to this length before the link and the
+/// countdown give way, and to the shorter one after.
+const SHORT_NAME: usize = 20;
 const SHORTEST_NAME: usize = 12;
 
 fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
@@ -947,7 +1007,14 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
     // Each segment has the rank it is dropped in when the window is narrow: highest first. Rank
     // 0 stays longest, after a long device name has been shortened.
     let mut segments: Vec<(u8, Vec<Span>)> = Vec::new();
-    if model.unreachable {
+    if let Some(until) = model.paused_until.filter(|&until| until > model.now) {
+        let until = until
+            .to_zoned(model.tz.clone())
+            .strftime("%H:%M")
+            .to_string();
+        let text = format!("○ requests paused until {until}");
+        segments.push((0, vec![Span::styled(text, Style::new().fg(WARN))]));
+    } else if model.unreachable {
         segments.push((
             0,
             vec![Span::styled("○ MELCloud unreachable", Style::new().fg(BAD))],
@@ -998,6 +1065,8 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
         }
         Line::from(spans)
     };
+    // Narrow windows lose the budget and the session first, then a long name gets shorter, then
+    // the link and the countdown go, then the name gets shorter still. What rank 0 says stays.
     let width = usize::from(area.width);
     loop {
         let over = line(&name, &segments).width().saturating_sub(width);
@@ -1005,12 +1074,18 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
             break;
         }
         let least = (0..segments.len()).max_by_key(|&i| segments[i].0);
+        let rank = least.map_or(0, |i| segments[i].0);
         let length = name.chars().count();
+        let shortest = if rank > 2 {
+            usize::MAX
+        } else if rank > 0 {
+            SHORT_NAME
+        } else {
+            SHORTEST_NAME
+        };
         match least {
-            Some(i) if segments[i].0 > 0 => drop(segments.remove(i)),
-            _ if length > SHORTEST_NAME => {
-                let keep = length.saturating_sub(over + 1).max(SHORTEST_NAME - 1);
-                name = name.chars().take(keep).chain(['…']).collect();
+            _ if length > shortest => {
+                name = shorten(&name, length.saturating_sub(over).max(shortest));
             }
             Some(i) => drop(segments.remove(i)),
             None => break,
@@ -1203,7 +1278,7 @@ mod tests {
     use super::*;
     use crate::tui::model::tests::{now, start, state};
     use crate::tui::model::{Msg, Start};
-    use ratatui::crossterm::event::KeyCode;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent};
 
     fn screen(model: &Model, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
@@ -1332,6 +1407,24 @@ mod tests {
         assert_eq!(at(14, 12), Some(Target::Fan(melcloud::FanSpeed::Level(3))));
         assert_eq!(at(60, 13), Some(Target::Row(Row::VaneVertical)));
         assert_eq!(at(5, 3), Some(Target::Row(Row::Temperature)));
+    }
+
+    #[test]
+    fn every_setting_is_on_screen_when_selected() {
+        for (width, height, tab) in [(46, 19, 0), (100, 28, 0)] {
+            let mut model = lived_in();
+            model.tab = tab;
+            for _ in 0..4 {
+                model.update(Msg::Key(KeyEvent::from(KeyCode::Down)));
+            }
+            let text = screen(&model, width, height);
+            assert!(text.contains("▸ vane ↔"), "{width}x{height}:\n{text}");
+            for _ in 0..4 {
+                model.update(Msg::Key(KeyEvent::from(KeyCode::Up)));
+            }
+            let text = screen(&model, width, height);
+            assert!(text.contains("▸ temp"), "{width}x{height}:\n{text}");
+        }
     }
 
     #[test]

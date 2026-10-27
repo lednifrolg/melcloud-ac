@@ -218,6 +218,26 @@ async fn state_is_read_for_device_and_building() {
 }
 
 #[tokio::test]
+async fn the_server_clock_comes_from_the_date_of_its_answers() {
+    let server = MockServer::start().await;
+    Mock::given(path("/Device/Get"))
+        .respond_with(
+            json_response(DEVICE_GET).insert_header("Date", "Thu, 15 Jan 2026 10:05:30 GMT"),
+        )
+        .mount(&server)
+        .await;
+    let client = client(&server);
+    assert_eq!(client.server_time(), None);
+
+    client
+        .ata_state(&session(), DeviceId(1_000_001), BuildingId(2_000_001))
+        .await
+        .unwrap();
+    let expected: jiff::Timestamp = "2026-01-15T10:05:30Z".parse().unwrap();
+    assert_eq!(client.server_time(), Some(expected));
+}
+
+#[tokio::test]
 async fn command_sends_the_state_with_changes() {
     let server = MockServer::start().await;
     Mock::given(path("/User/ListDevices"))

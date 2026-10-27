@@ -11,9 +11,14 @@ pub(crate) fn printable(text: String) -> String {
     }
 }
 
-/// A control character, or a bidirectional embedding, override or isolate.
+/// A control character, a line or paragraph separator, or a character that sets the direction
+/// of text: marks, embeddings, overrides and isolates.
 pub fn unsafe_to_show(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    c.is_control()
+        || matches!(
+            c,
+            '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{2028}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+        )
 }
 
 #[cfg(test)]
@@ -33,5 +38,6 @@ mod tests {
             "C1 and bidi"
         );
         assert_eq!(printable("Zoë's café".into()), "Zoë's café");
+        assert_eq!(printable("a\u{200f}b\u{2028}c".into()), "abc");
     }
 }

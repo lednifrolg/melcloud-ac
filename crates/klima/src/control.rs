@@ -299,7 +299,11 @@ pub async fn confirm(
 fn next_check(view: &AtaView) -> Timestamp {
     view.next_communication.map_or_else(
         || Timestamp::now() + LONGEST_WAIT,
-        |contact| contact + CONTACT_MARGIN,
+        |contact| {
+            contact
+                .checked_add(CONTACT_MARGIN)
+                .unwrap_or(Timestamp::MAX)
+        },
     )
 }
 

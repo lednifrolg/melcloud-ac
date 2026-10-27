@@ -22,6 +22,9 @@ pub const HOURLY_LIMIT: usize = 30;
 pub const READ_SPACING: SignedDuration = SignedDuration::from_secs(60);
 /// How long to stop after MELCloud answers HTTP 429.
 pub const THROTTLE_PAUSE: SignedDuration = SignedDuration::from_hours(6);
+/// How far in the future a ledger entry may lie before it counts as written by a clock that
+/// ran ahead.
+const FUTURE_TOLERANCE: SignedDuration = SignedDuration::from_mins(5);
 
 const HOUR: SignedDuration = SignedDuration::from_hours(1);
 
@@ -131,7 +134,8 @@ impl Ledger {
 
     /// MELCloud locked logins for `minutes`.
     pub fn login_locked(&mut self, now: Timestamp, minutes: u32) -> Timestamp {
-        let until = now + SignedDuration::from_mins(i64::from(minutes.max(1)));
+        let lock = SignedDuration::from_mins(i64::from(minutes.max(1)));
+        let until = now.checked_add(lock).unwrap_or(Timestamp::MAX);
         self.login_locked_until = Some(until);
         until
     }
@@ -142,10 +146,20 @@ impl Ledger {
         self.throttled_until.take().is_some()
     }
 
+    /// Drops what no longer counts, and what lies in the future: written while the clock ran
+    /// ahead, it would hold requests back until that time came.
     fn forget_before(&mut self, now: Timestamp) {
-        self.requests.retain(|&at| at + HOUR > now);
-        self.last_reads.retain(|_, &mut at| at + READ_SPACING > now);
-        self.throttled_until = self.throttled_until.filter(|&until| until > now);
+        let soon = now + FUTURE_TOLERANCE;
+        let within = |at: Timestamp, span: SignedDuration| {
+            at <= soon && at.checked_add(span).is_ok_and(|end| end > now)
+        };
+        self.requests.retain(|&at| within(at, HOUR));
+        self.last_reads
+            .retain(|_, &mut at| within(at, READ_SPACING));
+        let pause = THROTTLE_PAUSE + FUTURE_TOLERANCE;
+        self.throttled_until = self
+            .throttled_until
+            .filter(|&until| until > now && until.duration_since(now) <= pause);
         self.login_locked_until = self.login_locked_until.filter(|&until| until > now);
     }
 }

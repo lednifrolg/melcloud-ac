@@ -162,6 +162,27 @@ enum Command {
     },
 }
 
+/// Writes a man page for `command` and for each of its commands into `dir`, every one with
+/// klima's name and version in its footer.
+fn man_pages(command: clap::Command, dir: &std::path::Path) -> std::io::Result<()> {
+    fn write(command: clap::Command, dir: &std::path::Path, source: &str) -> std::io::Result<()> {
+        for sub in command.get_subcommands().filter(|s| !s.is_hide_set()) {
+            write(sub.clone(), dir, source)?;
+        }
+        clap_mangen::Man::new(command)
+            .source(source.to_owned())
+            .generate_to(dir)
+            .map(drop)
+    }
+    let mut command = command.disable_help_subcommand(true);
+    command.build();
+    write(
+        command,
+        dir,
+        &format!("klima {}", env!("CARGO_PKG_VERSION")),
+    )
+}
+
 /// A positive span of time for `--since`.
 fn past_span(text: &str) -> Result<Span, String> {
     match text.parse::<Span>() {
@@ -262,7 +283,7 @@ async fn run(cli: Cli) -> Result<(), AppError> {
                 )));
             }
             std::fs::create_dir_all(&dir)
-                .and_then(|()| clap_mangen::generate_to(Cli::command(), &dir))
+                .and_then(|()| man_pages(Cli::command(), &dir))
                 .map_err(|e| AppError::io(&dir, e))?;
             output::success(format_args!(
                 "man pages written to {0}; read one with `man -l {0}/klima.1`",
@@ -306,7 +327,9 @@ fn main() -> ExitCode {
     match runtime.block_on(run(cli)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            output::error(&error);
+            if !matches!(error, AppError::Shown(_)) {
+                output::error(&error);
+            }
             error.exit_code()
         }
     }

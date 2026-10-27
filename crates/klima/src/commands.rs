@@ -3,14 +3,14 @@
 use std::io::{self, BufRead, IsTerminal, Write};
 
 use jiff::tz::TimeZone;
-use jiff::{Span, Timestamp};
+use jiff::{SignedDuration, Span, Timestamp};
 use melcloud::{AtaState, Device};
 
 use crate::app::App;
 use crate::cache::{self, Cached, HISTORY_KEPT, STATE_TTL};
 use crate::chart::{self, Timeline};
 use crate::error::AppError;
-use crate::governor::{self, Refusal, Request};
+use crate::governor::{self, READ_SPACING, Refusal, Request};
 use crate::output::{self, Source, StatusReport};
 use crate::session;
 
@@ -180,14 +180,20 @@ pub async fn status(
             (Err(error), None) => return Err(error),
         },
     };
-    // A read refused only because the last one was moments ago leaves the data current.
-    let problem = problem.filter(|e| !matches!(e, AppError::Refused(Refusal::TooSoon { .. })));
+    // A read refused only because the last one was moments ago leaves the data current, unless
+    // that last one failed: then the state shown is older than it.
+    let problem = problem.filter(|e| match e {
+        AppError::Refused(Refusal::TooSoon { next_at }) => {
+            state.fetched_at < *next_at - READ_SPACING - SignedDuration::from_secs(1)
+        }
+        _ => true,
+    });
     let report = StatusReport {
         device,
         state: &state.value,
         fetched_at: state.fetched_at,
         source,
-        stale_because: problem.as_ref().map(ToString::to_string),
+        stale_because: problem.as_ref().map(output::message),
     };
     if json {
         output::status_json(&report);
@@ -198,7 +204,8 @@ pub async fn status(
             .expect("select() only returns air conditioners");
         output::status(&report, caps);
     }
-    problem.map_or(Ok(()), Err)
+    // The reason is in the output already; the exit code still tells a script.
+    problem.map_or(Ok(()), |error| Err(AppError::Shown(Box::new(error))))
 }
 
 /// `klima history`: states of the unit read in the last `span`, at most as far back as the

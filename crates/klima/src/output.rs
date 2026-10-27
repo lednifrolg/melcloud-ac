@@ -9,8 +9,8 @@ use anstyle::{Ansi256Color, AnsiColor, Style};
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use melcloud::{
-    AtaState, Capabilities, Device, DeviceId, DeviceKind, EffectiveFlags, FanSpeed, OperationMode,
-    WeatherKind,
+    AtaState, AtaView, Capabilities, Device, DeviceId, DeviceKind, EffectiveFlags, FanSpeed,
+    OperationMode, WeatherKind,
 };
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -82,8 +82,24 @@ pub fn duration(span: SignedDuration) -> String {
     }
 }
 
-/// The error with the causes that add something, in one line.
+/// The error with the causes that add something, in one line. A connection failure is named by
+/// its cause alone, without the request's URL: "could not reach MELCloud: connection refused".
 pub fn message(error: &AppError) -> String {
+    if let AppError::Api(melcloud::Error::Transport(e)) = error {
+        let mut cause: &dyn std::error::Error = e;
+        while let Some(inner) = cause.source() {
+            cause = inner;
+        }
+        let text = cause.to_string();
+        let text = text.split(" (os error").next().unwrap_or_default();
+        let mut chars = text.chars();
+        let first = chars.next().map(|c| c.to_lowercase().collect::<String>());
+        return format!(
+            "could not reach MELCloud: {}{}",
+            first.unwrap_or_default(),
+            chars.as_str()
+        );
+    }
     let mut message = error.to_string();
     let mut cause = error.source();
     while let Some(inner) = cause {
@@ -165,11 +181,10 @@ pub struct StatusReport<'a> {
     pub stale_because: Option<String>,
 }
 
-pub fn status(report: &StatusReport, caps: &Capabilities) {
-    let view = report.state.view();
-    let tone = if view.power { accent(view.mode) } else { DIM };
-    let model = report
-        .device
+/// Name and model, then whether the unit runs and in which mode; on two lines where one would
+/// wrap.
+fn status_heading(device: &Device, view: &AtaView, tone: Style) {
+    let model = device
         .model
         .as_deref()
         .map(|m| format!(" · {m}"))
@@ -179,13 +194,23 @@ pub fn status(report: &StatusReport, caps: &Capabilities) {
     } else {
         paint(DIM, "○ off")
     };
-    println!(
-        "{}{}   {power} {} {}",
-        paint(BOLD, &report.device.name),
-        paint(DIM, model),
+    let state = format!(
+        "{power} {} {}",
         paint(DIM, "·"),
         paint(tone.bold(), view.mode)
     );
+    let width = columns();
+    let name = shorten(&device.name, width.saturating_sub(model.chars().count()));
+    let state_width = if view.power { 4 } else { 5 } + 3 + view.mode.to_string().len();
+    let one_line = name.chars().count() + model.chars().count() + 3 + state_width <= width;
+    let gap = if one_line { "   " } else { "\n" };
+    println!("{}{}{gap}{state}", paint(BOLD, name), paint(DIM, model));
+}
+
+pub fn status(report: &StatusReport, caps: &Capabilities) {
+    let view = report.state.view();
+    let tone = if view.power { accent(view.mode) } else { DIM };
+    status_heading(report.device, view, tone);
 
     let outside = view
         .weather
@@ -352,11 +377,46 @@ pub fn devices(devices: &[Device], fetched_at: Timestamp) {
             ]
         })
         .collect();
-    let rows: Vec<_> = rows
-        .into_iter()
-        .map(|row| row.map(|cell| (cell, Style::new())))
-        .collect();
-    table(header, [false; 5], &rows);
+    // Where the table is wider than the terminal, the building gets shorter, then goes, then the
+    // name gets shorter.
+    let mut widths: [usize; 5] = std::array::from_fn(|column| {
+        rows.iter()
+            .map(|row| row[column].chars().count())
+            .chain([header[column].len()])
+            .max()
+            .unwrap_or(0)
+    });
+    let mut over = (widths.iter().sum::<usize>() + 2 * 4).saturating_sub(columns());
+    let shrink = |widths: &mut [usize; 5], column: usize, over: &mut usize| {
+        let cut = (*over).min(widths[column].saturating_sub(header[column].len().max(8)));
+        widths[column] -= cut;
+        *over -= cut;
+    };
+    shrink(&mut widths, 4, &mut over);
+    let building = over == 0;
+    if !building {
+        over = over.saturating_sub(widths[4] + 2);
+    }
+    shrink(&mut widths, 0, &mut over);
+    let cells = |row: [String; 5]| {
+        let mut column = 0;
+        row.map(|cell| {
+            let cell = shorten(&cell, widths[column]);
+            column += 1;
+            (cell, Style::new())
+        })
+    };
+    let rows: Vec<[(String, Style); 5]> = rows.into_iter().map(cells).collect();
+    if building {
+        table(header, [false; 5], &rows);
+    } else {
+        let [name, model, access, id, _] = header;
+        let rows: Vec<[(String, Style); 4]> = rows
+            .into_iter()
+            .map(|[name, model, access, id, _]| [name, model, access, id])
+            .collect();
+        table([name, model, access, id], [false; 4], &rows);
+    }
     println!(
         "{}",
         paint(
@@ -669,16 +729,23 @@ const HISTORY_LABELS: usize = 5;
 /// degree does not look like a jump.
 const SPARK_RANGE: f64 = 1.0;
 
+/// `text` cut to `width` characters, ending in "…" where it was cut.
+pub fn shorten(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        text.to_owned()
+    } else {
+        let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+        kept + "…"
+    }
+}
+
 /// `parts` joined by " · " on lines no wider than `width`, wrapping only between parts. The
 /// first part, in bold, is shortened with "…" when it alone is too wide.
 fn header(parts: &[String], width: usize) {
     let mut lines: Vec<String> = Vec::new();
     for (index, part) in parts.iter().enumerate() {
-        let shown = if index == 0 && part.chars().count() > width {
-            let cut: String = part.chars().take(width.saturating_sub(1)).collect();
-            paint(BOLD, format!("{cut}…"))
-        } else if index == 0 {
-            paint(BOLD, part)
+        let shown = if index == 0 {
+            paint(BOLD, shorten(part, width))
         } else {
             paint(DIM, part)
         };
@@ -710,14 +777,21 @@ pub fn history(device: &Device, span: &str, timeline: Timeline, samples: &[Sampl
         width: width.saturating_sub(HISTORY_LABELS).clamp(10, 160),
         ..timeline
     };
-    let since = timeline.since;
+    let Timeline { since, now, .. } = timeline;
+    // Samples after now were stamped by a clock that ran ahead; they are left out.
+    let samples = &samples[..samples.partition_point(|s| s.at <= now)];
     let shown = samples.iter().filter(|s| s.at >= since).count();
     let count = match shown {
         1 => "1 sample".to_owned(),
         n => format!("{n} samples"),
     };
     let columns = timeline.columns(samples);
-    let rooms = columns.iter().flatten().map(|c| c.room);
+    // The range of the readings themselves, with the one standing when the window opens.
+    let standing = samples.partition_point(|s| s.at < since).saturating_sub(1);
+    let rooms = samples[standing..]
+        .iter()
+        .filter(|s| s.at >= since || since.duration_since(s.at) <= GAP)
+        .map(|s| s.room);
     let low = rooms.clone().fold(f64::INFINITY, f64::min);
     let high = rooms.fold(f64::NEG_INFINITY, f64::max);
     let mut parts = vec![device.name.clone(), format!("last {span}"), count];
@@ -734,7 +808,7 @@ pub fn history(device: &Device, span: &str, timeline: Timeline, samples: &[Sampl
         match latest {
             Some(latest) => note(format!(
                 "No reads in the last {span}; the latest was {}.",
-                ago(latest.at, timeline.now)
+                ago(latest.at, now)
             )),
             None => note("Every read of the unit, by a command or the TUI, adds a sample."),
         }
