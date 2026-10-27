@@ -3,10 +3,10 @@
 Terminal client for Mitsubishi Electric air conditioners on the classic MELCloud service
 (`app.melcloud.com`): one-shot commands for the shell and an interactive TUI.
 
-![The TUI: the target raised and the mode changed, each confirmed by the unit; then the history in the shell](assets/demo.gif)
-
 Unofficial project, not affiliated with Mitsubishi Electric. It talks to an undocumented API
 and controls a real device on a real account.
+
+![klima status in the shell; then the TUI raising the target and the fan speed, each confirmed by the unit, and its help; then klima history](assets/demo.gif)
 
 ## Status
 
@@ -29,10 +29,11 @@ case "$(uname -sm)" in
   "Darwin x86_64") target=x86_64-apple-darwin ;;
   *) target=none; echo "no prebuilt klima for $(uname -sm); build it from source" ;;
 esac
-latest=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/lednifrolg/melcloud-ac/releases/latest)
+repo=https://github.com/lednifrolg/melcloud-ac
+latest=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$repo/releases/latest")
 tag=${latest##*/}
 cd "$(mktemp -d)"
-url="https://github.com/lednifrolg/melcloud-ac/releases/download/$tag"
+url="$repo/releases/download/$tag"
 [ "$target" != none ] &&
 curl -fsSLO "$url/klima-$target.tar.gz" &&
 curl -fsSLO "$url/SHA256SUMS" &&
@@ -48,7 +49,7 @@ by this repository's release workflow, and deletes it otherwise:
 
 ```sh
 gh attestation verify "klima-$target.tar.gz" --repo lednifrolg/melcloud-ac \
-  --cert-identity "https://github.com/lednifrolg/melcloud-ac/.github/workflows/release.yml@refs/tags/$tag" \
+  --cert-identity "$repo/.github/workflows/release.yml@refs/tags/$tag" \
   --deny-self-hosted-runners ||
 rm -f "klima-$target.tar.gz"
 ```
@@ -110,7 +111,8 @@ Shell completions and man pages come from the binary itself; run the line for yo
 again after updating klima. For bash, with the bash-completion package installed:
 
 ```sh
-mkdir -p ~/.local/share/bash-completion/completions && klima completions bash > ~/.local/share/bash-completion/completions/klima
+mkdir -p ~/.local/share/bash-completion/completions &&
+  klima completions bash > ~/.local/share/bash-completion/completions/klima
 ```
 
 For zsh:
@@ -124,7 +126,8 @@ and in `~/.zshrc`, `fpath=(~/.zfunc $fpath)` before `compinit` runs (with oh-my-
 `fpath=(~/.zfunc $fpath); autoload -Uz compinit && compinit`. For fish:
 
 ```sh
-mkdir -p ~/.config/fish/completions && klima completions fish > ~/.config/fish/completions/klima.fish
+mkdir -p ~/.config/fish/completions &&
+  klima completions fish > ~/.config/fish/completions/klima.fish
 ```
 
 elvish and PowerShell work the same way. The man pages, for `man klima`, `man klima-set` and the
@@ -142,6 +145,8 @@ anything is sent, leaves out settings the unit already has, and goes out as one 
 command. klima then waits until the unit's adapter has picked it up (a few seconds with MQTT)
 and checks the unit reports the new values. `--dry-run` shows the command without sending it,
 `--no-wait` returns right after sending.
+
+![klima status, then klima temp 23 confirmed by the unit's adapter, then klima history with its chart and the changes of the last day](assets/cli.png)
 
 With several devices, pick one with `--device <name or ID>` or set it in
 `~/.config/klima/config.toml`:
@@ -176,9 +181,7 @@ control pane shows the countdown, the wait for the adapter and the result. `⏎`
 a narrow window the panes become tabs (`Tab`, `1`-`4`). Colors come from the terminal's palette,
 so the TUI follows the terminal theme.
 
-| The dashboard | History in a narrow window | In the shell |
-|---|---|---|
-| ![The dashboard after switching to cool](assets/dashboard.png) | ![The history tab](assets/history.png) | ![klima status and klima history](assets/cli.png) |
+![The history tab in a narrow window: the room temperature over the last day, the target while heating, and when the unit heated](assets/history.png)
 
 `klima login --email <email> --password-stdin` reads the password from standard input, e.g. from
 a password manager. The password is never stored; only the session token is kept, readable only
@@ -192,47 +195,61 @@ directory.
 
 One-shot commands suit key bindings. `--no-wait` returns once MELCloud has the command,
 without spending further requests on checking it; the TUI or `klima status` shows the result.
-With Hyprland's Lua configuration, in `~/.config/hypr/hyprland.lua`:
+Every press is a command to MELCloud and counts against the request budget below. These use
+`SUPER + CTRL + ALT`, which Omarchy leaves free.
+
+With Hyprland 0.55 or later, in `~/.config/hypr/hyprland.lua`:
 
 ```lua
-local function klima(args)
-  return hl.dsp.exec_cmd("klima " .. args)
+local function klima(keys, what, command)
+  hl.bind(keys, hl.dsp.exec_cmd(command), { description = what })
 end
-hl.bind("SUPER + CTRL + ALT + A", klima("toggle --no-wait"), { description = "Air conditioner on or off" })
-hl.bind("SUPER + CTRL + ALT + UP", klima("temp +0.5 --no-wait"), { description = "Air conditioner warmer" })
-hl.bind("SUPER + CTRL + ALT + DOWN", klima("temp -0.5 --no-wait"), { description = "Air conditioner cooler" })
-hl.bind("SUPER + CTRL + ALT + K", hl.dsp.exec_cmd("kitty --class klima klima"), { description = "Air conditioner" })
-hl.window_rule({ match = { class = "^klima$" }, float = true, center = true, size = { 1100, 720 } })
+klima("SUPER + CTRL + ALT + A", "Air conditioner on or off", "klima toggle --no-wait")
+klima("SUPER + CTRL + ALT + UP", "Air conditioner warmer", "klima temp +0.5 --no-wait")
+klima("SUPER + CTRL + ALT + DOWN", "Air conditioner cooler", "klima temp -0.5 --no-wait")
+klima("SUPER + CTRL + ALT + K", "Air conditioner", "kitty --class klima klima")
+hl.window_rule({
+  match = { class = "^klima$" },
+  float = true,
+  center = true,
+  size = { 1100, 720 },
+})
 ```
 
-The last binding opens the TUI in a terminal with the class `klima`, which the window rule
-floats; with Alacritty that is `alacritty --class klima -e klima`, with foot
-`foot --app-id klima klima`. On Omarchy, `~/.config/hypr/bindings.lua` has the helpers for the
-same, and its own launcher for TUIs:
+The last binding opens the TUI in a terminal with the class `klima`, which the rule floats; with
+Alacritty that is `alacritty --class klima -e klima`, with foot `foot --app-id klima klima`.
+
+On Omarchy, its helpers do the same in `~/.config/hypr/bindings.lua`, with its own launcher for
+TUIs, which gives the window the class `org.omarchy.klima`:
 
 ```lua
 o.bind("SUPER + CTRL + ALT + A", "Air conditioner on or off", "klima toggle --no-wait")
 o.bind("SUPER + CTRL + ALT + UP", "Air conditioner warmer", "klima temp +0.5 --no-wait")
 o.bind("SUPER + CTRL + ALT + DOWN", "Air conditioner cooler", "klima temp -0.5 --no-wait")
-o.bind("SUPER + CTRL + ALT + K", "Air conditioner", "omarchy-launch-or-focus-tui klima")
+o.bind("SUPER + CTRL + ALT + K", "Air conditioner", { tui = "klima", focus = true })
+```
+
+and at the end of `~/.config/hypr/hyprland.lua`:
+
+```lua
 o.window("org.omarchy.klima", { float = true, center = true, size = { 1100, 720 } })
 ```
 
-With the classic `hyprland.conf`:
+With Hyprland 0.54 and its `hyprland.conf` (older versions write window rules differently):
 
 ```ini
 bind = SUPER CTRL ALT, A, exec, klima toggle --no-wait
 bind = SUPER CTRL ALT, UP, exec, klima temp +0.5 --no-wait
 bind = SUPER CTRL ALT, DOWN, exec, klima temp -0.5 --no-wait
 bind = SUPER CTRL ALT, K, exec, kitty --class klima klima
+windowrule = match:class ^klima$, float on, center on, size 1100 720
 ```
 
-A window rule for the class `klima`, in the syntax of the Hyprland version at hand, floats the
-TUI there.
+To see what a binding did, make it send the first line of klima's answer as a notification:
 
-To see what a binding did, send the output as a notification, for example
-`sh -c 'notify-send klima "$(klima toggle --no-wait 2>&1)"'`. Every press is a command to
-MELCloud and counts against the request budget below.
+```ini
+bind = SUPER CTRL ALT, A, exec, notify-send klima "$(klima toggle --no-wait 2>&1 | head -n 1)"
+```
 
 ### Request budget
 
@@ -281,18 +298,18 @@ English.
 The end-to-end tests run the `klima` binary against a mock server; `KLIMA_API_URL` points klima
 at a server other than MELCloud.
 
-The demo at the top and the screenshots come from `assets/demo.tape` and `assets/narrow.tape`,
-recorded with [vhs](https://github.com/charmbracelet/vhs) against a stand-in for MELCloud
+The demo and the screenshots come from the tapes in `assets/`, recorded with
+[vhs](https://github.com/charmbracelet/vhs) against a stand-in for MELCloud
 (`crates/klima/examples/demo_server.rs`), so they send nothing to the real service. vhs misses
 the TUI's alternate screen in its own screenshots, so they are frames of the recordings:
 
 ```sh
-cargo build -p klima --examples
+cargo build -p klima --bin klima --examples
 vhs assets/demo.tape
 vhs assets/narrow.tape
-ffmpeg -ss 17 -i assets/demo.mp4 -frames:v 1 -y assets/dashboard.png
+vhs assets/shell.tape
 ffmpeg -ss 3 -i assets/narrow.mp4 -frames:v 1 -y assets/history.png
-ffmpeg -ss 25 -i assets/demo.mp4 -frames:v 1 -vf crop=iw:450:0:0 -y assets/cli.png
+ffmpeg -ss 9.3 -i assets/shell.mp4 -frames:v 1 -vf crop=iw:470:0:0 -y assets/cli.png
 ```
 
 The checks CI runs:

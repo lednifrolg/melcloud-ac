@@ -1,7 +1,7 @@
 # The README's demo and screenshots, recorded with vhs (https://github.com/charmbracelet/vhs)
 # against the demo server in crates/klima/examples, so no request reaches MELCloud:
 #
-#   cargo build -p klima --examples
+#   cargo build -p klima --bin klima --examples
 #   vhs assets/demo.tape
 #
 # vhs's Screenshot command misses the TUI's alternate screen, so the screenshots are frames of
@@ -29,12 +29,11 @@ Type "echo demo | klima login --email user@example.com --password-stdin > /dev/n
 Enter
 Type "PS1='\[\e[1;34m\]❯\[\e[0m\] '; clear"
 Enter
+Type "klima status"
+Enter
 Sleep 1s
 Show
 
-Type "klima status"
-Sleep 300ms
-Enter
 Sleep 2.5s
 
 Type "klima"
@@ -47,9 +46,7 @@ Type "+"
 Sleep 1.2s
 Enter
 Sleep 3.5s
-Type "m"
-Sleep 400ms
-Type "m"
+Type "f"
 Sleep 1.2s
 Enter
 Sleep 4s
@@ -63,7 +60,7 @@ Sleep 500ms
 Type "klima history"
 Sleep 300ms
 Enter
-Sleep 4s
+Sleep 7s
 
 Hide
 Type "kill %1"

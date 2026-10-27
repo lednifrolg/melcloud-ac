@@ -2,15 +2,15 @@
 //! request reaches the real service.
 //!
 //! ```sh
-//! cargo run -p klima --example demo_server -- 18890 /tmp/klima-demo
-//! export KLIMA_HOME=/tmp/klima-demo KLIMA_API_URL=http://127.0.0.1:18890
+//! export KLIMA_HOME=$(mktemp -d) KLIMA_API_URL=http://127.0.0.1:18890
+//! cargo run -p klima --example demo_server -- 18890 "$KLIMA_HOME" &
 //! echo any-password | klima login --email user@example.com --password-stdin
 //! klima
 //! ```
 //!
 //! It serves the synthetic test data with the unit heating, logs any account in, applies a
-//! command a moment after it arrives, as an adapter would, and fills the history in the given
-//! home with a day of samples.
+//! command a moment after it arrives, as an adapter would, and fills the history of a new home
+//! directory with a day of samples.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -19,7 +19,7 @@ use std::time::Duration;
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 use serde_json::{Value, json};
-use wiremock::matchers::path;
+use wiremock::matchers::{path, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 const LOGIN: &str = include_str!("../../melcloud/tests/data/login.json");
@@ -33,14 +33,19 @@ const ADAPTER_DELAY: Duration = Duration::from_millis(1500);
 #[tokio::main]
 async fn main() {
     let mut args = std::env::args().skip(1);
-    let port: u16 = args.next().and_then(|p| p.parse().ok()).unwrap_or(18890);
+    let Some(port) = args.next().and_then(|p| p.parse::<u16>().ok()) else {
+        fail("usage: demo_server <port> [<new home directory>]");
+    };
     if let Some(home) = args.next().map(PathBuf::from) {
         prepare(&home);
     }
     let listener = std::net::TcpListener::bind(("127.0.0.1", port)).expect("the port is free");
     let server = MockServer::builder().listener(listener).start().await;
 
-    let unit = Unit(Arc::new(Mutex::new(heating())));
+    let unit = Unit(Arc::new(Mutex::new(State {
+        unit: heating(),
+        contact: Timestamp::now(),
+    })));
     Mock::given(path("/Login/ClientLogin3"))
         .respond_with(json_response(&login()))
         .mount(&server)
@@ -49,7 +54,9 @@ async fn main() {
         .respond_with(json_response(LIST_DEVICES))
         .mount(&server)
         .await;
+    // The other device on the list is not simulated; reading it gets a 404.
     Mock::given(path("/Device/Get"))
+        .and(query_param("id", DEVICE_ID.to_string()))
         .respond_with(ReadState(unit.clone()))
         .mount(&server)
         .await;
@@ -59,6 +66,11 @@ async fn main() {
         .await;
     println!("demo MELCloud on {}", server.uri());
     std::future::pending::<()>().await;
+}
+
+fn fail(message: &str) -> ! {
+    eprintln!("{message}");
+    std::process::exit(2);
 }
 
 fn json_response(body: &str) -> ResponseTemplate {
@@ -102,11 +114,17 @@ fn local(at: Timestamp) -> String {
         .to_string()
 }
 
+/// The unit as MELCloud reports it, and when its adapter was last in touch.
+struct State {
+    unit: Value,
+    contact: Timestamp,
+}
+
 #[derive(Clone)]
-struct Unit(Arc<Mutex<Value>>);
+struct Unit(Arc<Mutex<State>>);
 
 impl Unit {
-    fn lock(&self) -> std::sync::MutexGuard<'_, Value> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
@@ -118,8 +136,11 @@ impl Respond for ReadState {
     fn respond(&self, _: &Request) -> ResponseTemplate {
         let now = Timestamp::now();
         let mut state = self.0.lock();
-        state["LastCommunication"] = json!(utc(now - SignedDuration::from_secs(20)));
-        state["NextCommunication"] = json!(utc(now + SignedDuration::from_secs(40)));
+        // In touch once a minute, the last time at most 20 s ago, or when it took a command.
+        let contact = state.contact.max(now - SignedDuration::from_secs(20));
+        let state = &mut state.unit;
+        state["LastCommunication"] = json!(utc(contact));
+        state["NextCommunication"] = json!(utc(contact + SignedDuration::from_secs(60)));
         let times = [
             now,
             now + SignedDuration::from_hours(3),
@@ -139,17 +160,21 @@ struct TakeCommand(Unit);
 
 impl Respond for TakeCommand {
     fn respond(&self, request: &Request) -> ResponseTemplate {
-        let Ok(command) = serde_json::from_slice::<Value>(&request.body) else {
+        let command = serde_json::from_slice::<Value>(&request.body)
+            .ok()
+            .filter(|command| command.is_object() && command["DeviceID"] == DEVICE_ID);
+        let Some(command) = command else {
             return ResponseTemplate::new(400);
         };
         let unit = self.0.clone();
         let applied = command.clone();
         std::thread::spawn(move || {
             std::thread::sleep(ADAPTER_DELAY);
+            let now = Timestamp::now();
             let mut state = unit.lock();
-            *state = applied;
-            state["EffectiveFlags"] = json!(0);
-            state["LastCommunication"] = json!(utc(Timestamp::now()));
+            state.unit = applied;
+            state.unit["EffectiveFlags"] = json!(0);
+            state.contact = now;
         });
         json_response(&command.to_string())
     }
@@ -160,6 +185,12 @@ impl Respond for TakeCommand {
 fn prepare(home: &Path) {
     let config = home.join("config");
     let state = home.join("state");
+    if state.join("history.jsonl").exists() {
+        fail(&format!(
+            "{} has a history already; give a new, empty directory",
+            home.display()
+        ));
+    }
     for dir in [&config, &state] {
         std::fs::create_dir_all(dir).expect("the demo home can be written");
     }
@@ -172,12 +203,16 @@ fn prepare(home: &Path) {
     let now = Timestamp::now();
     let zone = TimeZone::system();
     let mut room = 20.8;
+    let mut target = 22.0;
     let mut lines = Vec::new();
     for step in (0..=144_i32).rev() {
         let at = now - SignedDuration::from_mins(i64::from(10 * step));
         let hour = at.to_zoned(zone.clone()).hour();
         let heating = matches!(hour, 6..=8 | 17..=22) || step <= 12;
-        let target = if hour >= 17 || step <= 12 { 22.5 } else { 22.0 };
+        // The target is set when the heating starts, and stays while the unit is off.
+        if heating {
+            target = if hour >= 17 || step <= 12 { 22.5 } else { 22.0 };
+        }
         let goal = if heating { target } else { 18.5 };
         let pace = if heating { 0.12 } else { 0.03 };
         room += (goal - room) * pace;

@@ -48,7 +48,7 @@ const FLASHED: Style = Style::new()
     .fg(Color::Indexed(15))
     .add_modifier(Modifier::BOLD);
 /// A turning fan.
-const FAN: [char; 4] = ['◐', '◓', '◑', '◒'];
+const FAN: [char; 4] = ['▖', '▘', '▝', '▗'];
 /// Time a swinging vane takes from one position to the next.
 const SWING_STEP: i64 = 250;
 
@@ -115,21 +115,22 @@ pub fn render(model: &Model, frame: &mut Frame) -> Vec<Hotspot> {
 /// history under it gets; the history takes what a taller window adds.
 const CONTROL_HEIGHT: u16 = 18;
 const HISTORY_MIN: u16 = 9;
-/// Height of the unit pane.
+/// Heights of the weather pane (three forecasts and the sun) and of the unit pane.
+const OUTSIDE_HEIGHT: u16 = 6;
 const UNIT_HEIGHT: u16 = 7;
 
-/// Control and history on the left; weather, unit and activity on the right, the activity
-/// taking what the other two leave.
+/// Control on the left of the top row; weather, unit and activity beside it, the activity
+/// taking what the other two leave. The history spans the width below and takes what a larger
+/// window adds.
 fn wide(model: &Model, frame: &mut Frame, body: Rect, spots: &mut Vec<Hotspot>) {
-    let [left, right] = Layout::horizontal([Constraint::Fill(7), Constraint::Fill(4)])
-        .spacing(1)
-        .areas(body);
     let top = body.height.saturating_sub(HISTORY_MIN).min(CONTROL_HEIGHT);
-    let [control_area, history_area] =
-        Layout::vertical([Constraint::Length(top), Constraint::Fill(1)]).areas(left);
-    let weather = u16::try_from(outside_lines(model).len()).unwrap_or(u16::MAX);
+    let [top, history_area] =
+        Layout::vertical([Constraint::Length(top), Constraint::Fill(1)]).areas(body);
+    let [control_area, right] = Layout::horizontal([Constraint::Fill(7), Constraint::Fill(4)])
+        .spacing(1)
+        .areas(top);
     let [outside_area, unit_area, activity_area] = Layout::vertical([
-        Constraint::Length(weather.saturating_add(2)),
+        Constraint::Length(OUTSIDE_HEIGHT),
         Constraint::Length(UNIT_HEIGHT),
         Constraint::Fill(1),
     ])
@@ -178,8 +179,10 @@ fn title(text: &str) -> Line<'_> {
     Line::from(vec![" ".into(), Span::styled(text, BOLD), " ".into()])
 }
 
+/// A secondary title on a border. Its own color, so the border's muted color does not dim it
+/// out of sight.
 fn dim_title(text: &str) -> Line<'static> {
-    Line::from(Span::styled(format!(" {text} "), DIM)).right_aligned()
+    Line::from(Span::styled(format!(" {text} "), DIM.fg(Color::Reset))).right_aligned()
 }
 
 fn mode_color(view: &AtaView) -> Option<Color> {
@@ -728,7 +731,8 @@ fn unit(model: &Model, frame: &mut Frame, area: Rect) {
         lines.push(Line::from(vec![
             label("energy"),
             format!("{}.{} kWh", meter / 1000, meter % 1000 / 100).into(),
-            Span::styled(" total ?", DIM),
+            // MELCloud does not say what its meter counts; the reading is not verified yet.
+            Span::styled(" · unverified", DIM),
         ]));
     }
     if let Some(last) = view.and_then(|v| v.last_communication) {
@@ -1118,10 +1122,10 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
 
 fn refresh_countdown(model: &Model) -> Vec<Span<'static>> {
     if model.busy == Some(Busy::State) {
-        return vec![Span::raw("↻ refreshing")];
+        return vec![Span::raw("refreshing")];
     }
     let Some(at) = model.next_refresh else {
-        return vec![Span::styled("↻ -", DIM)];
+        return vec![Span::styled("next -", DIM)];
     };
     let left = at.duration_since(model.now).as_secs().max(0);
     let every = model.refresh_every.as_secs().max(1);
@@ -1129,7 +1133,7 @@ fn refresh_countdown(model: &Model) -> Vec<Span<'static>> {
         .unwrap_or(0)
         .min(5);
     vec![
-        Span::raw(format!("↻ {}:{:02} ", left / 60, left % 60)),
+        Span::raw(format!("next {}:{:02} ", left / 60, left % 60)),
         Span::raw("━".repeat(filled)),
         Span::styled("─".repeat(5 - filled), DIM),
     ]
@@ -1476,9 +1480,9 @@ mod tests {
                 })
                 .collect::<String>()
         };
-        assert_eq!(glyphs(FanSpeed::Level(5), 125), "◐◓◑◒◐◓◑◒");
-        assert_eq!(glyphs(FanSpeed::Level(1), 625), "◐◓◑◒◐◓◑◒");
-        assert_eq!(glyphs(FanSpeed::Level(1), 125), "◐◐◐◐◐◓◓◓");
+        assert_eq!(glyphs(FanSpeed::Level(5), 125), "▖▘▝▗▖▘▝▗");
+        assert_eq!(glyphs(FanSpeed::Level(1), 625), "▖▘▝▗▖▘▝▗");
+        assert_eq!(glyphs(FanSpeed::Level(1), 125), "▖▖▖▖▖▘▘▘");
         assert_eq!(glyphs(FanSpeed::Auto, 375), glyphs(FanSpeed::Level(3), 375));
     }
 
