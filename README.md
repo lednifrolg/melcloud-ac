@@ -13,12 +13,14 @@ and controls a real device on a real account.
 
 Download the archive for your system from the
 [latest release](https://github.com/lednifrolg/melcloud-ac/releases/latest) and put `klima` on
-your PATH. Set `target` to `x86_64-unknown-linux-musl` or `aarch64-unknown-linux-musl` on Linux,
-`aarch64-apple-darwin` (Apple silicon) or `x86_64-apple-darwin` (Intel) on macOS:
+your PATH:
 
 ```sh
+# Linux: x86_64-unknown-linux-musl or aarch64-unknown-linux-musl
+# macOS: aarch64-apple-darwin (Apple silicon) or x86_64-apple-darwin (Intel)
 target=x86_64-unknown-linux-musl
-curl -fsSLO "https://github.com/lednifrolg/melcloud-ac/releases/latest/download/klima-$target.tar.gz"
+latest=https://github.com/lednifrolg/melcloud-ac/releases/latest/download
+curl -fsSLO "$latest/klima-$target.tar.gz"
 tar -xzf "klima-$target.tar.gz"
 mkdir -p ~/.local/bin && install -m 755 "klima-$target/klima" ~/.local/bin/
 ```
@@ -33,7 +35,10 @@ gh attestation verify "klima-$target.tar.gz" --repo lednifrolg/melcloud-ac \
 ```
 
 From source, with a recent Rust:
-`cargo install --git https://github.com/lednifrolg/melcloud-ac --tag v0.1.0 --locked klima`.
+
+```sh
+cargo install --git https://github.com/lednifrolg/melcloud-ac --tag v0.1.0 --locked klima
+```
 
 ## Usage
 
