@@ -5,7 +5,8 @@ all-features = true
 yanked = "deny"
 
 [licenses]
-allow = ["MIT", "Apache-2.0", "Unicode-3.0"]
+# ISC, BSD-3-Clause and CDLA-Permissive-2.0 (root certificate data) come with the rustls TLS stack.
+allow = ["MIT", "Apache-2.0", "Unicode-3.0", "ISC", "BSD-3-Clause", "CDLA-Permissive-2.0"]
 confidence-threshold = 0.93
 
 [bans]
@@ -13,6 +14,10 @@ multiple-versions = "warn"
 wildcards = "deny"
 # Path dependencies between the unpublished workspace crates carry no version.
 allow-wildcard-paths = true
+skip = [
+    { crate = "syn@2", reason = "proc-macro crates are moving to syn 3" },
+    { crate = "core-foundation@0.9", reason = "macOS-only, via reqwest's system proxy detection" },
+]
 
 [sources]
 unknown-registry = "deny"

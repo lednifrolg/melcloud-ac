@@ -8,7 +8,8 @@ and controls a real device on a real account.
 
 ## Status
 
-Early development: the workspace and CI are set up, the `klima` CLI does not do anything yet.
+Early development: the `melcloud` API client crate is in place, the `klima` CLI does not do
+anything yet.
 The API has been verified live for login, device listing, reading unit state and changing the
 target temperature.
 
@@ -42,6 +43,7 @@ The checks CI runs:
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo test --workspace --locked
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --locked
 cargo deny check
 ```
 
