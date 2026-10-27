@@ -102,7 +102,7 @@ impl Wanted {
 }
 
 /// Leaves out the settings the unit already has, so nothing is sent for them.
-fn changes(settings: ChangeSet, current: &AtaView) -> ChangeSet {
+pub fn changes(settings: ChangeSet, current: &AtaView) -> ChangeSet {
     ChangeSet {
         power: settings.power.filter(|&p| p != current.power),
         mode: settings.mode.filter(|&m| m != current.mode),
@@ -128,7 +128,7 @@ fn celsius(value: f64) -> String {
 }
 
 /// Each set field of `changes`, with its current value.
-fn describe(changes: &ChangeSet, current: &AtaView) -> Vec<Change> {
+pub fn describe(changes: &ChangeSet, current: &AtaView) -> Vec<Change> {
     let mut described = Vec::new();
     let mut add = |field, from: String, to: String| described.push(Change { field, from, to });
     if let Some(power) = changes.power {
@@ -255,7 +255,7 @@ pub async fn run(
 
 /// Waits for the adapter and checks the unit applied `changes`. Returns how long after sending
 /// the adapter picked the command up, when the clocks allow telling.
-async fn confirm(
+pub async fn confirm(
     app: &App,
     device: &Device,
     changes: &ChangeSet,

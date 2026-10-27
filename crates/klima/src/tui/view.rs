@@ -7,12 +7,15 @@ use melcloud::{AtaView, Capabilities, WeatherKind, WeatherObservation};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Flex, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span, Text};
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Clear, Padding, Paragraph, Sparkline, Wrap};
 
 use super::keymap::{BINDINGS, Hint};
-use super::model::{Busy, LoginForm, Model, Overlay, TABS, Tone};
+use super::model::{
+    Busy, Flight, LoginForm, Model, NOTICE_SHOWN, Overlay, Phase, Row, TABS, Target, Tone, rows,
+};
 use super::widgets::{BIG_TEXT_HEIGHT, BigText, scale};
+use crate::control;
 use crate::governor::HOURLY_LIMIT;
 use crate::output::{ago, duration};
 use crate::theme;
@@ -25,6 +28,17 @@ const GOOD: Color = Color::Indexed(2);
 const WARN: Color = Color::Indexed(3);
 const BAD: Color = Color::Indexed(1);
 const OVERLAY: Color = Color::Indexed(4);
+const BUSY: Color = Color::Indexed(6);
+/// Background of the selected control row.
+const SELECTED: Color = Color::Indexed(8);
+const SPINNER: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// A screen area the mouse can point at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hotspot {
+    pub area: Rect,
+    pub target: Target,
+}
 
 /// Smallest window for the narrow layout, and for the wide one.
 const TABS_MIN: (u16, u16) = (46, 19);
@@ -48,12 +62,14 @@ fn shape(area: Rect) -> Shape {
     }
 }
 
-pub fn render(model: &Model, frame: &mut Frame) {
+/// Draws the whole screen and returns the areas the mouse can point at, most specific last.
+pub fn render(model: &Model, frame: &mut Frame) -> Vec<Hotspot> {
     let area = frame.area();
     let shape = shape(area);
+    let mut spots = Vec::new();
     if shape == Shape::TooSmall {
         too_small(frame, area);
-        return;
+        return spots;
     }
     let [body, status, hints] = Layout::vertical([
         Constraint::Fill(1),
@@ -62,34 +78,35 @@ pub fn render(model: &Model, frame: &mut Frame) {
     ])
     .areas(area);
     if shape == Shape::Wide {
-        wide(model, frame, body);
+        wide(model, frame, body, &mut spots);
     } else {
-        tabs(model, frame, body);
+        tabs(model, frame, body, &mut spots);
     }
     statusline(model, frame, status);
     hint_bar(model, frame, hints, shape);
     match &model.overlay {
         Overlay::Help => help(frame, area),
         Overlay::Login(form) => login(model, form, frame, area),
-        Overlay::None => {}
+        Overlay::None => return spots,
     }
+    Vec::new()
 }
 
-fn wide(model: &Model, frame: &mut Frame, body: Rect) {
+fn wide(model: &Model, frame: &mut Frame, body: Rect, spots: &mut Vec<Hotspot>) {
     let [top, bottom] = Layout::vertical([Constraint::Fill(1), Constraint::Length(9)]).areas(body);
     let columns = || Layout::horizontal([Constraint::Fill(7), Constraint::Fill(4)]).spacing(1);
     let [control_area, side] = columns().areas(top);
     let [outside_area, unit_area] =
         Layout::vertical([Constraint::Fill(1), Constraint::Length(7)]).areas(side);
     let [history_area, activity_area] = columns().areas(bottom);
-    control(model, frame, control_area);
+    control(model, frame, control_area, spots);
     outside(model, frame, outside_area);
     unit(model, frame, unit_area);
     history(model, frame, history_area);
     activity(model, frame, activity_area);
 }
 
-fn tabs(model: &Model, frame: &mut Frame, body: Rect) {
+fn tabs(model: &Model, frame: &mut Frame, body: Rect, spots: &mut Vec<Hotspot>) {
     let [bar, pane] = Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(body);
     let spans = TABS.iter().enumerate().map(|(index, name)| {
         let label = format!(" {} {name} ", index + 1);
@@ -101,7 +118,7 @@ fn tabs(model: &Model, frame: &mut Frame, body: Rect) {
     });
     frame.render_widget(Line::from(spans.collect::<Vec<_>>()), bar);
     match model.tab {
-        0 => control(model, frame, pane),
+        0 => control(model, frame, pane, spots),
         1 => {
             let [outside_area, unit_area] =
                 Layout::vertical([Constraint::Fill(1), Constraint::Length(7)]).areas(pane);
@@ -138,10 +155,10 @@ fn current_weather(view: &AtaView) -> Option<&WeatherObservation> {
     view.weather.iter().find(|w| w.kind == WeatherKind::Current)
 }
 
-fn control(model: &Model, frame: &mut Frame, area: Rect) {
+fn control(model: &Model, frame: &mut Frame, area: Rect, spots: &mut Vec<Hotspot>) {
     let device = model.device();
     let name = device.map_or("klima", |d| d.name.as_str());
-    let Some(state) = &model.state else {
+    let Some(view) = model.shown() else {
         let text = if model.account.is_none() {
             "Log in to see the unit."
         } else if model.busy.is_some() {
@@ -153,8 +170,7 @@ fn control(model: &Model, frame: &mut Frame, area: Rect) {
         frame.render_widget(Paragraph::new(text).style(DIM).block(block), area);
         return;
     };
-    let view = state.value.view();
-    let color = mode_color(view);
+    let color = mode_color(&view);
     let tone = color.map_or(DIM, |c| Style::new().fg(c));
     let power = if view.power {
         Span::styled("● on", Style::new().fg(GOOD))
@@ -175,44 +191,16 @@ fn control(model: &Model, frame: &mut Frame, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let [digits_row, _, scale_rows, _, rows] = Layout::vertical([
+    let [digits_row, _, scale_rows, _, rows_area, status_area] = Layout::vertical([
         Constraint::Length(BIG_TEXT_HEIGHT),
         Constraint::Length(1),
         Constraint::Length(2),
         Constraint::Length(1),
         Constraint::Fill(1),
+        Constraint::Length(2),
     ])
     .areas(inner);
-    let target = format!("{:.1}", view.target_temperature);
-    let digits = BigText {
-        text: &target,
-        style: tone,
-    };
-    let [digits_area, _, side_area] = Layout::horizontal([
-        Constraint::Length(digits.width()),
-        Constraint::Length(3),
-        Constraint::Fill(1),
-    ])
-    .areas(digits_row);
-    frame.render_widget(digits, digits_area);
-    let mut side = vec![
-        Line::from(vec![
-            Span::styled("°C", tone.add_modifier(Modifier::BOLD)),
-            Span::styled(" target", DIM),
-        ]),
-        Line::default(),
-        Line::from(vec![
-            format!("{:.1}°", view.room_temperature).into(),
-            Span::styled(" room", DIM),
-        ]),
-    ];
-    if let Some(weather) = current_weather(view) {
-        side.push(Line::from(vec![
-            format!("{:.0}°", weather.temperature).into(),
-            Span::styled(" outside", DIM),
-        ]));
-    }
-    frame.render_widget(Paragraph::new(side), side_area);
+    temperature(&view, tone, frame, digits_row, spots);
 
     let Some(caps) = device.and_then(|d| d.capabilities.as_ref()) else {
         return;
@@ -236,71 +224,253 @@ fn control(model: &Model, frame: &mut Frame, area: Rect) {
         view.mode, range.min, range.max, caps.temperature_step
     );
     frame.render_widget(Line::styled(legend, DIM), legend_line);
-    frame.render_widget(Paragraph::new(control_rows(view, caps, color)), rows);
+    control_rows(model.row, &view, caps, color, frame, rows_area, spots);
+    command_status(model, frame, status_area);
 }
 
-fn control_rows(view: &AtaView, caps: &Capabilities, color: Option<Color>) -> Text<'static> {
+/// The target in big digits, with the room and outside temperature beside it.
+fn temperature(
+    view: &AtaView,
+    tone: Style,
+    frame: &mut Frame,
+    area: Rect,
+    spots: &mut Vec<Hotspot>,
+) {
+    let target = format!("{:.1}", view.target_temperature);
+    let digits = BigText {
+        text: &target,
+        style: tone,
+    };
+    let [digits_area, _, side_area] = Layout::horizontal([
+        Constraint::Length(digits.width()),
+        Constraint::Length(3),
+        Constraint::Fill(1),
+    ])
+    .areas(area);
+    frame.render_widget(digits, digits_area);
+    spots.push(Hotspot {
+        area: digits_area,
+        target: Target::Row(Row::Temperature),
+    });
+    let mut side = vec![
+        Line::from(vec![
+            Span::styled("°C", tone.add_modifier(Modifier::BOLD)),
+            Span::styled(" target", DIM),
+        ]),
+        Line::default(),
+        Line::from(vec![
+            format!("{:.1}°", view.room_temperature).into(),
+            Span::styled(" room", DIM),
+        ]),
+    ];
+    if let Some(weather) = current_weather(view) {
+        side.push(Line::from(vec![
+            format!("{:.0}°", weather.temperature).into(),
+            Span::styled(" outside", DIM),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(side), side_area);
+}
+
+/// Width of the marker of the selected row and of the setting names.
+const MARKER: u16 = 2;
+const LABEL: u16 = 8;
+
+fn control_rows(
+    selected: Row,
+    view: &AtaView,
+    caps: &Capabilities,
+    color: Option<Color>,
+    frame: &mut Frame,
+    area: Rect,
+    spots: &mut Vec<Hotspot>,
+) {
     let tone = color.map_or(DIM, |c| Style::new().fg(c));
-    let label = |text: &str| Span::styled(format!("{text:<8}"), DIM);
-    let mut lines = vec![Line::from(vec![
-        label("temp"),
-        Span::styled(format!("{:.1} °C", view.target_temperature), BOLD),
-    ])];
-
-    let mut modes = vec![Span::styled(format!("{:<7}", "mode"), DIM)];
-    for &mode in &caps.modes {
-        let pill = format!(" {mode} ");
-        modes.push(match (mode == view.mode, color) {
-            (true, Some(color)) => Span::styled(pill, BOLD.fg(Color::Black).bg(color)),
-            (true, None) => Span::styled(pill, BOLD.add_modifier(Modifier::REVERSED)),
-            (false, _) => Span::styled(pill, DIM),
-        });
-    }
-    lines.push(Line::from(modes));
-
-    if caps.fan_levels > 0 {
-        let mut fan = vec![label("fan")];
-        fan.extend((1..=caps.fan_levels).map(|level| {
-            let lit = theme::fan_bar_lit(level, view.fan_speed);
-            Span::styled(
-                theme::fan_bar(level, caps.fan_levels).to_string(),
-                if lit { tone } else { DIM },
-            )
-        }));
-        let value = match view.fan_speed {
-            melcloud::FanSpeed::Level(level) => format!(" {level}/{}", caps.fan_levels),
-            other => format!(" {other}"),
-        };
-        fan.push(value.into());
-        lines.push(Line::from(fan));
-    }
-    let vane = |name: &str, marks: [bool; 5], value: String| {
-        let mut spans = vec![label(name)];
-        spans.extend(marks.map(|on| {
+    let label =
+        |text: &str| Span::styled(format!("{text:<width$}", width = usize::from(LABEL)), DIM);
+    let marks = |marks: [bool; 5]| {
+        marks.map(|on| {
             if on {
                 Span::styled("●", tone)
             } else {
                 Span::styled("∙", DIM)
             }
-        }));
-        spans.push(format!(" {value}").into());
-        Line::from(spans)
+        })
     };
-    if caps.vane_vertical {
-        lines.push(vane(
-            "vane ↕",
-            theme::vertical_marks(view.vane_vertical),
-            view.vane_vertical.to_string(),
-        ));
+    let mut specific = Vec::new();
+    for (row, y) in rows(caps).into_iter().zip(area.y..area.bottom()) {
+        let x = area.x + MARKER + LABEL;
+        let spans = match row {
+            Row::Temperature => vec![
+                label("temp"),
+                Span::styled(format!("{:.1} °C", view.target_temperature), BOLD),
+            ],
+            Row::Mode => {
+                // Pills start one column early so their names line up with the other values.
+                let mut spans = vec![label("mode").content(format!("{:<7}", "mode"))];
+                let mut pill_x = x - 1;
+                for &mode in &caps.modes {
+                    let pill = format!(" {mode} ");
+                    let width = u16::try_from(pill.chars().count()).unwrap_or(0);
+                    specific.push(Hotspot {
+                        area: Rect::new(pill_x, y, width, 1),
+                        target: Target::Mode(mode),
+                    });
+                    pill_x += width;
+                    spans.push(match (mode == view.mode, color) {
+                        (true, Some(color)) => Span::styled(pill, BOLD.fg(Color::Black).bg(color)),
+                        (true, None) => Span::styled(pill, BOLD.add_modifier(Modifier::REVERSED)),
+                        (false, _) => Span::styled(pill, DIM),
+                    });
+                }
+                spans
+            }
+            Row::Fan => {
+                let mut spans = vec![label("fan")];
+                for (level, bar_x) in (1..=caps.fan_levels).zip(x..) {
+                    let lit = theme::fan_bar_lit(level, view.fan_speed);
+                    let bar = theme::fan_bar(level, caps.fan_levels).to_string();
+                    spans.push(Span::styled(bar, if lit { tone } else { DIM }));
+                    specific.push(Hotspot {
+                        area: Rect::new(bar_x, y, 1, 1),
+                        target: Target::Fan(melcloud::FanSpeed::Level(level)),
+                    });
+                }
+                spans.push(match view.fan_speed {
+                    melcloud::FanSpeed::Level(level) => {
+                        format!(" {level}/{}", caps.fan_levels).into()
+                    }
+                    other => format!(" {other}").into(),
+                });
+                spans
+            }
+            Row::VaneVertical => [
+                vec![label("vane ↕")],
+                marks(theme::vertical_marks(view.vane_vertical)).to_vec(),
+                vec![format!(" {}", view.vane_vertical).into()],
+            ]
+            .concat(),
+            Row::VaneHorizontal => [
+                vec![label("vane ↔")],
+                marks(theme::horizontal_marks(view.vane_horizontal)).to_vec(),
+                vec![format!(" {}", view.vane_horizontal).into()],
+            ]
+            .concat(),
+        };
+        let line_area = Rect::new(area.x, y, area.width, 1);
+        spots.push(Hotspot {
+            area: line_area,
+            target: Target::Row(row),
+        });
+        let mut line = Line::from(
+            [
+                vec![if row == selected {
+                    Span::styled("▸ ", tone)
+                } else {
+                    "  ".into()
+                }],
+                spans,
+            ]
+            .concat(),
+        );
+        if row == selected {
+            line = line.style(Style::new().bg(SELECTED));
+        }
+        frame.render_widget(line, line_area);
     }
-    if caps.vane_horizontal {
-        lines.push(vane(
-            "vane ↔",
-            theme::horizontal_marks(view.vane_horizontal),
-            view.vane_horizontal.to_string(),
-        ));
-    }
-    Text::from(lines)
+    spots.extend(specific);
+}
+
+/// The two lines under the settings: waiting changes, a command on its way, or how the last one
+/// ended.
+fn command_status(model: &Model, frame: &mut Frame, area: Rect) {
+    let base = model.state.as_ref().map(|s| s.value.view().clone());
+    let described = |changes| {
+        base.as_ref()
+            .map(|base| {
+                control::describe(&changes, base)
+                    .into_iter()
+                    .map(|c| format!("{} {} → {}", c.field, c.from, c.to))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            })
+            .unwrap_or_default()
+    };
+    let spinner = || {
+        let frame = model.now.as_millisecond().rem_euclid(800) / 80;
+        Span::styled(
+            SPINNER[usize::try_from(frame).unwrap_or(0)].to_string(),
+            Style::new().fg(BUSY),
+        )
+    };
+    let lines: Vec<Line> = if let Some(pending) = model.pending {
+        let left = pending
+            .deadline
+            .duration_since(model.now)
+            .max(SignedDuration::ZERO);
+        let millis = |d: SignedDuration| u128::try_from(d.as_millis()).unwrap_or(0);
+        let window = millis(super::model::MERGE_WINDOW).max(1);
+        let filled = usize::try_from((millis(left) * 10).div_ceil(window))
+            .unwrap_or(10)
+            .min(10);
+        let headline = if model.quitting {
+            Line::from(vec![
+                Span::styled("QUIT? ", BOLD.fg(WARN)),
+                Span::styled("these changes are not sent yet", Style::new().fg(WARN)),
+            ])
+        } else {
+            Line::from(vec![
+                Span::styled("PENDING ", BOLD.fg(WARN)),
+                Span::styled("━".repeat(filled), Style::new().fg(WARN)),
+                Span::styled("─".repeat(10 - filled), DIM),
+                Span::styled(
+                    format!(" {:.1} s", left.as_secs_f64()),
+                    Style::new().fg(WARN),
+                ),
+            ])
+        };
+        vec![headline, Line::raw(described(pending.changes))]
+    } else if let Some(Flight {
+        changes,
+        phase,
+        since,
+    }) = model.flight
+    {
+        let doing = match phase {
+            Phase::Sending => "sending".to_owned(),
+            Phase::Confirming => {
+                let seconds = model.now.duration_since(since).as_secs_f64();
+                format!("waiting for the adapter · {seconds:.1} s")
+            }
+        };
+        vec![
+            Line::from(vec![
+                spinner(),
+                " ".into(),
+                Span::styled(doing, Style::new().fg(BUSY)),
+            ]),
+            Line::styled(described(changes), DIM),
+        ]
+    } else if let Some(notice) = model
+        .notice
+        .as_ref()
+        .filter(|n| n.at + NOTICE_SHOWN > model.now)
+    {
+        let (mark, color) = match notice.tone {
+            Tone::Good => ("✓", GOOD),
+            Tone::Info => ("·", Color::Reset),
+            Tone::Warn => ("!", WARN),
+            Tone::Bad => ("✗", BAD),
+        };
+        vec![Line::from(vec![
+            Span::styled(mark, Style::new().fg(color)),
+            " ".into(),
+            Span::styled(notice.text.clone(), Style::new().fg(color)),
+        ])]
+    } else {
+        Vec::new()
+    };
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), area);
 }
 
 /// "now", "today", "tonight", "tomorrow", "Wed night", ... for a forecast entry at `time`.
@@ -592,6 +762,9 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
     let view = model.state.as_ref().map(|s| s.value.view());
     let color = view.and_then(mode_color).unwrap_or(Color::Indexed(7));
     let label = match (model.busy, &model.overlay) {
+        _ if model.quitting => "QUIT?",
+        _ if model.pending.is_some() => "PENDING",
+        _ if model.flight.is_some() => "SENDING",
         (Some(Busy::Login), _) | (_, Overlay::Login(_)) => "LOGIN",
         (Some(_), _) => "LOADING",
         (None, _) => "READY",
@@ -675,27 +848,67 @@ fn refresh_countdown(model: &Model) -> Vec<Span<'static>> {
 }
 
 fn hint_bar(model: &Model, frame: &mut Frame, area: Rect, shape: Shape) {
+    let controllable = model.account.is_some()
+        && model.shown().is_some()
+        && model.device().is_some_and(|d| d.capabilities.is_some());
     let shown = |hint: Hint| match hint {
         Hint::Always => true,
+        Hint::Control => controllable,
+        Hint::Pending => model.pending.is_some(),
         Hint::Tabs => shape == Shape::Tabs,
-        Hint::LoggedOut => model.account.is_none(),
         Hint::Never => false,
     };
-    let hints: Vec<(&str, &str)> = match &model.overlay {
-        Overlay::Login(_) => vec![("⏎", "log in"), ("Tab", "next field"), ("Esc", "cancel")],
-        Overlay::Help => vec![("?", "close")],
-        Overlay::None => BINDINGS
-            .iter()
-            .filter(|b| shown(b.hint))
-            .map(|b| (b.keys.split_whitespace().next().unwrap_or(b.keys), b.label))
-            .collect(),
+    // (rank, keys, label); a lower rank stays longer when the window is narrow.
+    let mut hints: Vec<(u8, &str, &str)> = match &model.overlay {
+        Overlay::Login(_) => vec![
+            (0, "⏎", "log in"),
+            (0, "Tab", "next field"),
+            (0, "Esc", "cancel"),
+        ],
+        Overlay::Help => vec![(0, "?", "close")],
+        Overlay::None if model.quitting => {
+            vec![
+                (0, "⏎", "send and quit"),
+                (0, "u", "discard and quit"),
+                (0, "Esc", "stay"),
+            ]
+        }
+        Overlay::None => {
+            let refresh = if model.account.is_some() {
+                "refresh"
+            } else {
+                "log in"
+            };
+            let mut bindings: Vec<_> = BINDINGS.iter().filter(|b| shown(b.hint)).collect();
+            // Waiting changes come first: they are what the next key is most likely for.
+            bindings.sort_by_key(|b| b.hint != Hint::Pending);
+            bindings
+                .into_iter()
+                .map(|b| {
+                    (
+                        b.rank,
+                        b.short,
+                        if b.short == "r" { refresh } else { b.label },
+                    )
+                })
+                .collect()
+        }
     };
-    let mut spans = vec![" ".into()];
-    for (key, label) in hints {
-        spans.push(Span::styled(key, BOLD));
-        spans.push(Span::styled(format!(" {label}  "), DIM));
+    let line = |hints: &[(u8, &str, &str)]| {
+        let mut spans = vec![Span::raw(" ")];
+        for (_, key, label) in hints {
+            spans.push(Span::styled(key.to_string(), BOLD));
+            spans.push(Span::styled(format!(" {label}  "), DIM));
+        }
+        Line::from(spans)
+    };
+    while line(&hints).width() > usize::from(area.width) {
+        let Some(least) = (0..hints.len()).max_by_key(|&i| hints[i].0) else {
+            break;
+        };
+        hints.remove(least);
     }
-    frame.render_widget(Line::from(spans), area);
+    frame.render_widget(line(&hints), area);
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -797,10 +1010,15 @@ mod tests {
     use super::*;
     use crate::tui::model::tests::{now, start, state};
     use crate::tui::model::{Msg, Start};
+    use ratatui::crossterm::event::KeyCode;
 
     fn screen(model: &Model, width: u16, height: u16) -> String {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| render(model, frame)).unwrap();
+        terminal
+            .draw(|frame| {
+                render(model, frame);
+            })
+            .unwrap();
         terminal.backend().to_string()
     }
 
@@ -850,6 +1068,64 @@ mod tests {
         let mut model = lived_in();
         model.overlay = Overlay::Help;
         insta::assert_snapshot!(screen(&model, 120, 30));
+    }
+
+    #[test]
+    fn waiting_changes_and_their_countdown() {
+        let mut model = lived_in();
+        model.update(Msg::Key(KeyCode::Char('+').into()));
+        model.update(Msg::Key(KeyCode::Char('f').into()));
+        model.update(Msg::Key(KeyCode::Char('j').into()));
+        model.update(Msg::Tick(model.now + SignedDuration::from_millis(1200)));
+        insta::assert_snapshot!(screen(&model, 120, 30));
+    }
+
+    #[test]
+    fn command_on_its_way_and_its_result() {
+        let mut model = lived_in();
+        model.update(Msg::Key(KeyCode::Char('P').into()));
+        model.update(Msg::Key(KeyCode::Enter.into()));
+        model.update(Msg::Sent(Ok(())));
+        model.update(Msg::Tick(model.now + SignedDuration::from_millis(1700)));
+        insta::assert_snapshot!("confirming", screen(&model, 120, 30));
+        model.update(Msg::Confirmed {
+            result: Ok(Some(SignedDuration::from_millis(1100))),
+            state: None,
+        });
+        insta::assert_snapshot!("applied", screen(&model, 120, 30));
+    }
+
+    #[test]
+    fn quitting_with_waiting_changes() {
+        let mut model = lived_in();
+        model.update(Msg::Key(KeyCode::Char('m').into()));
+        model.update(Msg::Key(KeyCode::Char('q').into()));
+        insta::assert_snapshot!(screen(&model, 120, 30));
+    }
+
+    #[test]
+    fn hotspots_point_at_modes_fan_levels_and_rows() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut spots = Vec::new();
+        terminal
+            .draw(|frame| spots = render(&lived_in(), frame))
+            .unwrap();
+        let at = |x, y| {
+            spots
+                .iter()
+                .rev()
+                .find(|s| s.area.contains(ratatui::layout::Position::new(x, y)))
+                .map(|s| s.target)
+        };
+        // Rows 10 to 14 hold the settings; values start at column 12, mode pills at 11.
+        assert_eq!(
+            at(12, 11),
+            Some(Target::Mode(melcloud::OperationMode::Heat))
+        );
+        assert_eq!(at(30, 11), Some(Target::Mode(melcloud::OperationMode::Fan)));
+        assert_eq!(at(14, 12), Some(Target::Fan(melcloud::FanSpeed::Level(3))));
+        assert_eq!(at(60, 13), Some(Target::Row(Row::VaneVertical)));
+        assert_eq!(at(5, 3), Some(Target::Row(Row::Temperature)));
     }
 
     #[test]
