@@ -16,11 +16,13 @@ pub fn mode_color(mode: OperationMode) -> u8 {
     }
 }
 
+/// Bars of rising height, for fan levels and sparklines.
+pub const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
 /// Bar for fan level `level` of `levels`: rising from `▁` to `█`.
 pub fn fan_bar(level: u8, levels: u8) -> char {
-    const BLOCKS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
     let top = usize::from(levels.max(2)) - 1;
-    BLOCKS[(usize::from(level.max(1)) - 1) * 7 / top]
+    BARS[(usize::from(level.max(1)) - 1) * 7 / top]
 }
 
 /// Whether the bar for `level` is lit at fan speed `fan`; every bar is lit in auto.

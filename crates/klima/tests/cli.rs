@@ -391,3 +391,160 @@ async fn old_state_is_shown_with_the_reason_it_was_not_refreshed() {
     assert!(text.contains("updated 20 min ago · cached"), "{text}");
     assert!(stderr(&output).contains("HTTP 500"), "{}", stderr(&output));
 }
+
+/// Writes history lines for the living room, `minutes` ago each, with `power` and `mode`.
+fn write_history(klima: &Klima, samples: &[(i64, bool, &str, f64)]) {
+    let state = klima.file("state");
+    fs::create_dir_all(&state).unwrap();
+    let mut lines: Vec<String> = samples
+        .iter()
+        .map(|&(minutes, power, mode, target)| {
+            let at = Timestamp::now() - SignedDuration::from_mins(minutes);
+            json!({
+                "at": at, "device": 1_000_001, "power": power, "mode": mode,
+                "target": target, "room": 21.5, "outside": 3.0, "fan": "auto", "error_code": 8000
+            })
+            .to_string()
+        })
+        .collect();
+    let other = json!({
+        "at": Timestamp::now(), "device": 1_000_002, "power": true, "mode": "cool",
+        "target": 18.0, "room": 30.0, "fan": "1", "error_code": 8000
+    });
+    lines.push(other.to_string());
+    lines.push("not a sample".into());
+    fs::write(state.join("history.jsonl"), lines.join("\n") + "\n").unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_charts_the_day_and_lists_the_changes_without_reading_the_unit() {
+    let klima = Klima::new().await;
+    klima.login_for(SignedDuration::from_hours(1)).await;
+    klima.mock_account().await;
+    write_history(
+        &klima,
+        &[
+            (300, false, "heat", 22.0),
+            (240, false, "heat", 22.0),
+            (180, true, "heat", 22.0),
+            (120, true, "heat", 23.5),
+            (60, true, "cool", 23.5),
+            (30, true, "cool", 23.5),
+        ],
+    );
+
+    let output = klima.run(&[&LIVING_ROOM[..], &["history"]].concat()).await;
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(
+        text.starts_with("Living room · last 24 h · 6 samples\n"),
+        "{text}"
+    );
+    assert!(text.contains("room 21.5-21.5°"), "{text}");
+    assert!(text.contains("now\n\nCHANGED"), "{text}");
+    let changes: Vec<&str> = text
+        .lines()
+        .skip_while(|line| !line.starts_with("CHANGED"))
+        .collect();
+    assert_eq!(changes.len(), 5, "header and four changes: {text}");
+    assert!(changes[1].contains("off    heat  22.0 °C"), "{text}");
+    assert!(changes[2].contains("on     heat  22.0 °C"), "{text}");
+    assert!(changes[3].contains("on     heat  23.5 °C"), "{text}");
+    assert!(changes[4].contains("on     cool  23.5 °C"), "{text}");
+    assert_eq!(klima.requests_to("/Device/Get").await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_as_json_covers_the_asked_span() {
+    let klima = Klima::new().await;
+    klima.login_for(SignedDuration::from_hours(1)).await;
+    klima.mock_account().await;
+    write_history(
+        &klima,
+        &[(300, false, "heat", 22.0), (60, true, "cool", 23.5)],
+    );
+
+    let output = klima
+        .run(&[&LIVING_ROOM[..], &["history", "--since", "2h", "--json"]].concat())
+        .await;
+
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let report: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    assert_eq!(report["device"]["name"], "Living room");
+    let samples = report["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 1, "{report}");
+    assert_eq!(samples[0]["mode"], "cool");
+    assert_eq!(samples[0]["target_temperature"], 23.5);
+    assert_eq!(samples[0]["outside_temperature"], 3.0);
+    assert_eq!(samples[0]["fan_speed"], "auto");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_grows_with_every_read_of_the_unit() {
+    let klima = Klima::new().await;
+    klima.login_for(SignedDuration::from_hours(1)).await;
+    klima.mock_account().await;
+
+    let empty = klima.run(&[&LIVING_ROOM[..], &["history"]].concat()).await;
+    assert_eq!(code(&empty), 0, "{}", stderr(&empty));
+    assert!(stdout(&empty).contains("· 0 samples"), "{}", stdout(&empty));
+    assert!(
+        stderr(&empty).contains("adds a sample"),
+        "{}",
+        stderr(&empty)
+    );
+
+    let status = klima.run(&[&LIVING_ROOM[..], &["status"]].concat()).await;
+    assert_eq!(code(&status), 0, "{}", stderr(&status));
+    let output = klima
+        .run(&[&LIVING_ROOM[..], &["history", "--json"]].concat())
+        .await;
+    let report: Value = serde_json::from_str(&stdout(&output)).unwrap();
+    let samples = report["samples"].as_array().unwrap();
+    assert_eq!(samples.len(), 1, "{report}");
+    assert_eq!(samples[0]["room_temperature"], 24.5);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn history_rejects_a_span_that_is_not_one() {
+    let klima = Klima::new().await;
+    for since in ["yesterday", "0h", "-2h"] {
+        let output = klima.run(&["history", &format!("--since={since}")]).await;
+        assert_eq!(code(&output), 2, "{since}");
+        assert!(
+            stderr(&output).contains("expected a duration such as 24h, 90m or 7d"),
+            "{}",
+            stderr(&output)
+        );
+    }
+    assert_eq!(klima.server.received_requests().await.unwrap().len(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn completions_and_man_pages_need_no_setup() {
+    let klima = Klima::new().await;
+    for (shell, expected) in [
+        ("bash", "_klima()"),
+        ("zsh", "#compdef klima"),
+        ("fish", "complete -c klima"),
+    ] {
+        let output = klima.run(&["completions", shell]).await;
+        assert_eq!(code(&output), 0, "{}", stderr(&output));
+        let script = stdout(&output);
+        assert!(script.contains(expected), "{shell}: {script}");
+        assert!(script.contains("history"), "{shell} completes the commands");
+    }
+
+    let dir = klima.file("man/man1");
+    let output = klima.run(&["man", dir.to_str().unwrap()]).await;
+    assert_eq!(code(&output), 0, "{}", stderr(&output));
+    let page = fs::read_to_string(dir.join("klima.1")).unwrap();
+    assert!(page.contains(".TH klima 1"), "{page}");
+    assert!(page.contains("klima\\-history(1)"), "{page}");
+    assert!(dir.join("klima-history.1").exists());
+    assert!(!dir.join("klima-help.1").exists());
+
+    assert_eq!(klima.server.received_requests().await.unwrap().len(), 0);
+    assert!(!klima.file("state").exists() && !klima.file("config").exists());
+}

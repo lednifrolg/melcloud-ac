@@ -2,6 +2,7 @@
 
 mod app;
 mod cache;
+mod chart;
 mod commands;
 mod config;
 mod control;
@@ -14,9 +15,12 @@ mod session;
 mod theme;
 mod tui;
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, CommandFactory, Parser, Subcommand};
+use clap_complete::Shell;
+use jiff::Span;
 use melcloud::{FanSpeed, OperationMode, VaneHorizontal, VaneVertical};
 
 use crate::app::App;
@@ -65,6 +69,12 @@ enum Command {
         /// Ask MELCloud even if the cached state is recent.
         #[arg(long)]
         fresh: bool,
+    },
+    /// Show how the room temperature and the settings changed, from states read before.
+    History {
+        /// How far back: 24h, 90m, 7d.
+        #[arg(long, default_value = "24h", value_parser = past_span, value_name = "DURATION")]
+        since: Span,
     },
     /// Switch the unit on.
     On {
@@ -136,6 +146,22 @@ enum Command {
     },
     /// Lift the local pause after MELCloud throttled the account (HTTP 429).
     Unblock,
+    /// Print a shell completion script, e.g. `klima completions zsh > ~/.zfunc/_klima`.
+    Completions { shell: Shell },
+    /// Write the man pages, one for klima and one per command, e.g. `klima man
+    /// ~/.local/share/man/man1`.
+    Man {
+        /// Directory for the pages; created when missing.
+        dir: PathBuf,
+    },
+}
+
+/// A positive span of time for `--since`.
+fn past_span(text: &str) -> Result<Span, String> {
+    match text.parse::<Span>() {
+        Ok(span) if span.is_positive() => Ok(span),
+        _ => Err("expected a duration such as 24h, 90m or 7d".into()),
+    }
 }
 
 /// The settings a command asks for, with the options it was given.
@@ -207,11 +233,33 @@ fn wanted(command: &Command) -> Option<(Wanted, Options)> {
         | Command::Logout
         | Command::Devices { .. }
         | Command::Status { .. }
-        | Command::Unblock => return None,
+        | Command::History { .. }
+        | Command::Unblock
+        | Command::Completions { .. }
+        | Command::Man { .. } => return None,
     })
 }
 
 async fn run(cli: Cli) -> Result<(), AppError> {
+    // These need no configuration, so they work before anything is set up.
+    match cli.command {
+        Some(Command::Completions { shell }) => {
+            let mut script = Vec::new();
+            clap_complete::generate(shell, &mut Cli::command(), "klima", &mut script);
+            return output::raw(&script);
+        }
+        Some(Command::Man { dir }) => {
+            std::fs::create_dir_all(&dir)
+                .and_then(|()| clap_mangen::generate_to(Cli::command(), &dir))
+                .map_err(|e| AppError::io(&dir, e))?;
+            output::success(format_args!(
+                "man pages written to {}; try `man klima`",
+                dir.display()
+            ));
+            return Ok(());
+        }
+        _ => {}
+    }
     let app = App::new()?;
     let Some(command) = cli.command else {
         return tui::run(app).await;
@@ -228,6 +276,9 @@ async fn run(cli: Cli) -> Result<(), AppError> {
         Command::Devices { fresh } => commands::devices(&app, fresh, cli.json).await,
         Command::Status { fresh } => {
             commands::status(&app, cli.device.as_deref(), fresh, cli.json).await
+        }
+        Command::History { since } => {
+            commands::history(&app, cli.device.as_deref(), since, cli.json).await
         }
         Command::Unblock => commands::unblock(&app),
         _ => unreachable!("commands that change the unit are handled above"),

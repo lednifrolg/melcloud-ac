@@ -2,11 +2,13 @@
 
 use std::io::{self, BufRead, IsTerminal, Write};
 
-use jiff::Timestamp;
+use jiff::tz::TimeZone;
+use jiff::{Span, Timestamp};
 use melcloud::{AtaState, Device};
 
 use crate::app::App;
-use crate::cache::{self, Cached, STATE_TTL};
+use crate::cache::{self, Cached, HISTORY_KEPT, STATE_TTL};
+use crate::chart;
 use crate::error::AppError;
 use crate::governor::{self, Refusal, Request};
 use crate::output::{self, Source, StatusReport};
@@ -197,4 +199,34 @@ pub async fn status(
         output::status(&report, caps);
     }
     problem.map_or(Ok(()), Err)
+}
+
+/// `klima history`: states of the unit read in the last `span`, at most as far back as the
+/// history is kept. Asks MELCloud for nothing but the device list, and only when the cached one
+/// is a day old.
+pub async fn history(
+    app: &App,
+    wanted: Option<&str>,
+    span: Span,
+    json: bool,
+) -> Result<(), AppError> {
+    let list = app.devices(false).await?;
+    let wanted = wanted.or(app.config.device.as_deref());
+    let device = select(list.value.devices(), wanted)?;
+    let now = Timestamp::now();
+    let tz = TimeZone::system();
+    // Nothing older is kept.
+    let oldest = now - HISTORY_KEPT;
+    let since = now
+        .to_zoned(tz.clone())
+        .checked_sub(span)
+        .map_or(oldest, |since| since.timestamp().max(oldest));
+    // A little more, so the chart can show the state the unit was in at its left edge.
+    let samples = cache::history(&app.paths, device.id, since - chart::GAP);
+    if json {
+        output::history_json(device, since, &samples);
+    } else {
+        output::history(device, since, now, &samples, &tz);
+    }
+    Ok(())
 }

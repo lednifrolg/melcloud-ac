@@ -6,15 +6,13 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::OpenOptions;
-use std::os::unix::fs::OpenOptionsExt;
 
 use jiff::{SignedDuration, Timestamp};
 use melcloud::DeviceId;
 use serde::{Deserialize, Serialize};
 
 use crate::error::AppError;
-use crate::files::{private_dir, read_json, write_json};
+use crate::files::{self, read_json, write_json};
 use crate::output::{local_time, seconds_until};
 use crate::paths::Paths;
 
@@ -169,18 +167,7 @@ pub fn requests_last_hour(paths: &Paths, now: Timestamp) -> usize {
 
 /// Runs `change` on the ledger while holding the lock that serializes all klima processes.
 pub fn update<T>(paths: &Paths, change: impl FnOnce(&mut Ledger) -> T) -> Result<T, AppError> {
-    let lock_path = paths.ledger_lock();
-    if let Some(dir) = lock_path.parent() {
-        private_dir(dir)?;
-    }
-    let lock = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(&lock_path)
-        .map_err(|e| AppError::io(&lock_path, e))?;
-    lock.lock().map_err(|e| AppError::io(&lock_path, e))?;
+    let _lock = files::lock(&paths.ledger_lock())?;
     let mut ledger = read_json(&paths.ledger())?.unwrap_or_default();
     let result = change(&mut ledger);
     write_json(&paths.ledger(), &ledger)?;

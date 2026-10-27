@@ -15,6 +15,8 @@ use melcloud::{
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::cache::Sample;
+use crate::chart::{Timeline, cell};
 use crate::error::AppError;
 use crate::theme;
 
@@ -24,6 +26,8 @@ const GREEN: Style = AnsiColor::Green.on_default();
 const YELLOW: Style = AnsiColor::Yellow.on_default();
 const RED: Style = AnsiColor::Red.on_default();
 const CYAN: Style = AnsiColor::Cyan.on_default();
+/// The room temperature in history charts, as in the TUI.
+const ROOM: Style = AnsiColor::Blue.on_default();
 
 /// The color that stands for a mode, as in the TUI.
 fn accent(mode: OperationMode) -> Style {
@@ -102,6 +106,16 @@ pub fn note(text: impl std::fmt::Display) {
 
 pub fn success(text: impl std::fmt::Display) {
     println!("{} {text}", paint(GREEN, "✓"));
+}
+
+/// Writes `bytes` to standard output as they are. A reader that stops early, like `head`, is
+/// not an error.
+pub fn raw(bytes: &[u8]) -> Result<(), AppError> {
+    let mut stdout = io::stdout().lock();
+    match stdout.write_all(bytes).and_then(|()| stdout.flush()) {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Err(AppError::io("standard output", e)),
+        _ => Ok(()),
+    }
 }
 
 pub fn json(value: &impl Serialize) {
@@ -324,28 +338,11 @@ pub fn devices(devices: &[Device], fetched_at: Timestamp) {
             ]
         })
         .collect();
-    let width = |column: usize| {
-        rows.iter()
-            .map(|row| row[column].chars().count())
-            .chain([header[column].len()])
-            .max()
-            .unwrap_or(0)
-    };
-    let widths: Vec<usize> = (0..header.len()).map(width).collect();
-    let line = |cells: &[&str]| {
-        cells
-            .iter()
-            .zip(&widths)
-            .map(|(cell, &w)| format!("{cell:<w$}"))
-            .collect::<Vec<_>>()
-            .join("  ")
-            .trim_end()
-            .to_owned()
-    };
-    println!("{}", paint(DIM, line(&header)));
-    for row in &rows {
-        println!("{}", line(&row.each_ref().map(String::as_str)));
-    }
+    let rows: Vec<_> = rows
+        .into_iter()
+        .map(|row| row.map(|cell| (cell, Style::new())))
+        .collect();
+    table(header, &rows);
     println!(
         "{}",
         paint(
@@ -353,6 +350,39 @@ pub fn devices(devices: &[Device], fetched_at: Timestamp) {
             format!("updated {}", ago(fetched_at, Timestamp::now()))
         )
     );
+}
+
+/// A table with a dim header and columns as wide as their widest cell.
+fn table<const N: usize>(header: [&str; N], rows: &[[(String, Style); N]]) {
+    let widths: [usize; N] = std::array::from_fn(|column| {
+        rows.iter()
+            .map(|row| row[column].0.chars().count())
+            .chain([header[column].len()])
+            .max()
+            .unwrap_or(0)
+    });
+    // Padding goes inside the color, and the last column gets none.
+    let line = |cells: [(&str, Style); N]| {
+        cells
+            .into_iter()
+            .zip(widths)
+            .enumerate()
+            .map(|(column, ((text, style), width))| {
+                let width = if column + 1 == N { 0 } else { width };
+                paint(style, format!("{text:<width$}"))
+            })
+            .collect::<Vec<_>>()
+            .join("  ")
+            .trim_end()
+            .to_owned()
+    };
+    println!("{}", line(header.map(|text| (text, DIM))));
+    for row in rows {
+        println!(
+            "{}",
+            line(row.each_ref().map(|(text, style)| (text.as_str(), *style)))
+        );
+    }
 }
 
 #[derive(Serialize)]
@@ -591,4 +621,166 @@ mod tests {
         assert_eq!(glyphs, "▁▂▄▆█");
         assert_eq!(fan_bars(FanSpeed::Auto, 4, BOLD).matches(&dim).count(), 0);
     }
+}
+
+/// Width of the chart in `klima history`: the terminal's, or 80 columns when the output is not a
+/// terminal, so piped output does not depend on the window.
+fn chart_width(labels: usize) -> usize {
+    let columns = if io::stdout().is_terminal() {
+        ratatui::crossterm::terminal::size().map_or(80, |(width, _)| usize::from(width))
+    } else {
+        80
+    };
+    columns.saturating_sub(labels).clamp(24, 120)
+}
+
+/// `klima history`: the room temperature as a sparkline, the modes under it, and a table of the
+/// changes. `samples` may start a little before `since`, to show the state the unit was in then.
+pub fn history(
+    device: &Device,
+    since: Timestamp,
+    now: Timestamp,
+    samples: &[Sample],
+    tz: &TimeZone,
+) {
+    let shown: Vec<&Sample> = samples.iter().filter(|s| s.at >= since).collect();
+    let count = match shown.len() {
+        1 => "1 sample".to_owned(),
+        n => format!("{n} samples"),
+    };
+    println!(
+        "{}{}",
+        paint(BOLD, &device.name),
+        paint(
+            DIM,
+            format!(" · last {} · {count}", duration(now.duration_since(since)))
+        )
+    );
+    if shown.is_empty() {
+        note("Every read of the unit, by a command or the TUI, adds a sample.");
+        return;
+    }
+
+    let low = shown.iter().map(|s| s.room).fold(f64::INFINITY, f64::min);
+    let high = shown
+        .iter()
+        .map(|s| s.room)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let room_label = format!("room {low:.1}-{high:.1}°");
+    let labels = room_label.chars().count() + 2;
+    let timeline = Timeline {
+        since,
+        now,
+        width: chart_width(labels),
+    };
+    let columns = timeline.columns(samples);
+    let spark: String = columns
+        .iter()
+        .map(|column| match column {
+            Some(s) => {
+                let share = if high > low {
+                    (s.room - low) / (high - low)
+                } else {
+                    0.5
+                };
+                paint(ROOM, theme::BARS[cell(share, theme::BARS.len() - 1)])
+            }
+            None => " ".to_owned(),
+        })
+        .collect();
+    let modes: String = columns
+        .iter()
+        .map(|column| match column {
+            Some(s) if s.power => paint(accent(s.mode), "▀"),
+            Some(_) => paint(DIM, "·"),
+            None => " ".to_owned(),
+        })
+        .collect();
+    println!("{}{spark}", paint(DIM, format!("{room_label:<labels$}")));
+    println!("{}{modes}", paint(DIM, format!("{:<labels$}", "mode")));
+    println!("{}{}", " ".repeat(labels), paint(DIM, timeline.axis(tz)));
+    println!();
+
+    // One time format for the whole table: the clock alone within today, the weekday within a
+    // week, the date beyond.
+    let today = now.to_zoned(tz.clone()).date();
+    let format = if since.to_zoned(tz.clone()).date() == today {
+        "%H:%M"
+    } else if now.duration_since(since) < SignedDuration::from_hours(24 * 6) {
+        "%a %H:%M"
+    } else {
+        "%Y-%m-%d %H:%M"
+    };
+    // The first state, then each change of what the unit was asked to do.
+    let mut rows = Vec::new();
+    let mut previous: Option<&Sample> = None;
+    for &sample in &shown {
+        let changed = previous.is_none_or(|p| {
+            p.power != sample.power
+                || p.mode != sample.mode
+                || (p.target - sample.target).abs() > 0.01
+        });
+        previous = Some(sample);
+        if !changed {
+            continue;
+        }
+        let tone = if sample.power {
+            accent(sample.mode)
+        } else {
+            DIM
+        };
+        let plain = Style::new();
+        rows.push([
+            (
+                sample.at.to_zoned(tz.clone()).strftime(format).to_string(),
+                plain,
+            ),
+            ((if sample.power { "on" } else { "off" }).to_owned(), plain),
+            (sample.mode.to_string(), tone),
+            (format!("{:.1} °C", sample.target), plain),
+            (format!("{:.1} °C", sample.room), plain),
+        ]);
+    }
+    table(["CHANGED", "POWER", "MODE", "TARGET", "ROOM"], &rows);
+}
+
+#[derive(Serialize)]
+struct HistoryJson<'a> {
+    device: DeviceRef<'a>,
+    since: Timestamp,
+    samples: Vec<SampleJson>,
+}
+
+#[derive(Serialize)]
+struct SampleJson {
+    at: Timestamp,
+    power: bool,
+    mode: String,
+    target_temperature: f64,
+    room_temperature: f64,
+    outside_temperature: Option<f64>,
+    fan_speed: Option<String>,
+}
+
+pub fn history_json(device: &Device, since: Timestamp, samples: &[Sample]) {
+    json(&HistoryJson {
+        device: DeviceRef {
+            id: device.id,
+            name: &device.name,
+        },
+        since,
+        samples: samples
+            .iter()
+            .filter(|s| s.at >= since)
+            .map(|s| SampleJson {
+                at: s.at,
+                power: s.power,
+                mode: s.mode.to_string(),
+                target_temperature: s.target,
+                room_temperature: s.room,
+                outside_temperature: s.outside,
+                fan_speed: s.fan.map(|fan| fan.to_string()),
+            })
+            .collect(),
+    });
 }

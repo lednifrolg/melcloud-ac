@@ -29,6 +29,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::app::App;
 use crate::cache::{self, Cached, DEVICES_TTL};
+use crate::chart;
 use crate::control;
 use crate::error::AppError;
 use crate::governor::{self, Refusal, Request};
@@ -49,7 +50,15 @@ enum Incoming {
     Msg(Box<Msg>),
     Mouse(MouseEvent),
 }
+
+/// Time the history chart spans.
 const HISTORY_SPAN: SignedDuration = SignedDuration::from_hours(24);
+
+/// The oldest sample the chart can use: a little before its left edge, which still shows the
+/// state the unit was in then.
+fn history_start(now: Timestamp) -> Timestamp {
+    now - HISTORY_SPAN - chart::GAP
+}
 
 pub async fn run(app: App) -> Result<(), AppError> {
     if !io::stdout().is_terminal() || !io::stdin().is_terminal() {
@@ -92,7 +101,7 @@ fn start(app: &App) -> Result<Start, AppError> {
     });
     let state = device.and_then(|id| cache::load::<AtaState>(&app.paths.state_of(id)));
     let history = device
-        .map(|id| cache::history(&app.paths, id, now - HISTORY_SPAN))
+        .map(|id| cache::history(&app.paths, id, history_start(now)))
         .unwrap_or_default();
     let email = app
         .config
@@ -334,7 +343,7 @@ impl Watched {
             messages.push(Msg::External(state));
         }
         if changed(&app.paths.history(), &mut self.history) {
-            let history = cache::history(&app.paths, device.id, now - HISTORY_SPAN);
+            let history = cache::history(&app.paths, device.id, history_start(now));
             messages.push(Msg::History(history));
         }
         messages

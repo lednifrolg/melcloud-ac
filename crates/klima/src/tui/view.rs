@@ -4,7 +4,7 @@ use std::fmt::Display;
 
 use jiff::civil::Date;
 use jiff::civil::DateTime;
-use jiff::{RoundMode, SignedDuration, Timestamp, Unit, ZonedRound};
+use jiff::{SignedDuration, Timestamp};
 use melcloud::{
     AtaView, Capabilities, FanSpeed, VaneHorizontal, VaneVertical, WeatherKind, WeatherObservation,
 };
@@ -17,13 +17,15 @@ use ratatui::widgets::{
     Axis, Block, BorderType, Chart, Clear, Dataset, GraphType, Padding, Paragraph, Wrap,
 };
 
+use super::HISTORY_SPAN;
 use super::keymap::{BINDINGS, Hint};
 use super::model::{
     Busy, Flight, LoginForm, Model, NOTICE_SHOWN, Overlay, Phase, Quit, Row, TABS, Target, Tone,
     rows,
 };
-use super::widgets::{BIG_TEXT_HEIGHT, BigText, cell, scale};
+use super::widgets::{BIG_TEXT_HEIGHT, BigText, scale};
 use crate::cache::Sample;
+use crate::chart::{GAP, Timeline};
 use crate::control;
 use crate::governor::HOURLY_LIMIT;
 use crate::output::{ago, duration};
@@ -704,14 +706,18 @@ fn unit(model: &Model, frame: &mut Frame, area: Rect) {
     );
 }
 
-/// Time the history chart spans.
-const DAY: SignedDuration = SignedDuration::from_hours(24);
-/// Samples further apart are not joined: the unit was not read in between.
-const GAP: SignedDuration = SignedDuration::from_mins(45);
+/// Colors of the room and target temperature in the history chart.
+const ROOM: Color = Color::Indexed(4);
+const TARGET: Color = MUTED;
 
 fn history(model: &Model, frame: &mut Frame, area: Rect) {
-    let since = model.now - DAY;
-    let samples: Vec<&Sample> = model.history.iter().filter(|s| s.at >= since).collect();
+    let since = model.now - HISTORY_SPAN;
+    let samples: Vec<Sample> = model
+        .history
+        .iter()
+        .filter(|s| s.at >= since)
+        .copied()
+        .collect();
     let mut block = pane(title("History · 24 h"), MUTED);
     match samples.len() {
         0 => {}
@@ -741,42 +747,49 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
     let [labels, plot] = columns.areas(plot_rows);
     let [ribbon_label, ribbon] = columns.areas(ribbon_row);
     let [_, axis] = columns.areas(axis_row);
+    let timeline = Timeline {
+        since,
+        now: model.now,
+        width: usize::from(plot.width),
+    };
 
-    let rooms = samples.iter().map(|s| s.room);
-    let low = rooms.clone().fold(f64::INFINITY, f64::min);
-    let high = rooms.fold(f64::NEG_INFINITY, f64::max);
+    // The target matters only while the unit runs.
+    let target = |s: &Sample| s.power.then_some(s.target);
+    let values: Vec<f64> = samples
+        .iter()
+        .flat_map(|s| [Some(s.room), target(s)])
+        .flatten()
+        .collect();
+    let low = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let mut label_lines = vec![Line::default(); usize::from(labels.height)];
     if let [first, .., last] = label_lines.as_mut_slice() {
         *first = Line::styled(format!("{high:.1}°"), DIM);
         *last = Line::styled(format!("{low:.1}°"), DIM);
     }
+    let middle = label_lines.len() / 2;
     if label_lines.len() >= 3 {
-        let middle = label_lines.len() / 2;
-        label_lines[middle] = Line::styled("room", DIM);
+        label_lines[middle] = Line::styled("room", Style::new().fg(ROOM));
+    }
+    if label_lines.len() >= 5 && samples.iter().any(|s| s.power) {
+        label_lines[middle + 1] = Line::styled("target", Style::new().fg(TARGET));
     }
     frame.render_widget(Paragraph::new(label_lines), labels);
     frame.render_widget(Line::styled("mode", DIM), ribbon_label);
 
-    // Gaps without reads split the line.
-    let x = |at: Timestamp| at.duration_since(since).as_secs_f64();
-    let mut segments: Vec<Vec<(f64, f64)>> = Vec::new();
-    let mut previous: Option<Timestamp> = None;
-    for sample in &samples {
-        match segments.last_mut() {
-            Some(segment) if previous.is_some_and(|p| sample.at.duration_since(p) <= GAP) => {
-                segment.push((x(sample.at), sample.room));
-            }
-            _ => segments.push(vec![(x(sample.at), sample.room)]),
-        }
-        previous = Some(sample.at);
-    }
-    let datasets = segments
+    let targets = segments(&samples, &timeline, target);
+    let rooms = segments(&samples, &timeline, |s| Some(s.room));
+    // The room line is drawn last, so it stays on top where the two meet.
+    let lines = targets
         .iter()
-        .map(|points| {
+        .map(|points| (points, TARGET))
+        .chain(rooms.iter().map(|points| (points, ROOM)));
+    let datasets = lines
+        .map(|(points, color)| {
             Dataset::default()
                 .marker(Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(Style::new().fg(Color::Indexed(4)))
+                .style(Style::new().fg(color))
                 .data(points)
         })
         .collect();
@@ -784,74 +797,55 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
     // flat day runs mid-height.
     let margin = ((high - low) / (f64::from(plot.height) * 4.0)).max(0.05);
     let chart = Chart::new(datasets)
-        .x_axis(Axis::default().bounds([0.0, DAY.as_secs_f64()]))
+        .x_axis(Axis::default().bounds([0.0, 1.0]))
         .y_axis(Axis::default().bounds([low - margin, high + margin]))
         .legend_position(None);
     frame.render_widget(chart, plot);
-    frame.render_widget(mode_ribbon(&samples, since, ribbon.width), ribbon);
-    frame.render_widget(time_axis(model, axis.width), axis);
+    frame.render_widget(mode_ribbon(&timeline, &model.history), ribbon);
+    frame.render_widget(Line::styled(timeline.axis(&model.tz), DIM), axis);
+}
+
+/// Points of `value` over the timeline, split where the unit went unread for longer than
+/// [`GAP`] or `value` has nothing.
+fn segments(
+    samples: &[Sample],
+    timeline: &Timeline,
+    value: impl Fn(&Sample) -> Option<f64>,
+) -> Vec<Vec<(f64, f64)>> {
+    let mut segments: Vec<Vec<(f64, f64)>> = Vec::new();
+    let mut previous: Option<Timestamp> = None;
+    for sample in samples {
+        let Some(y) = value(sample) else {
+            previous = None;
+            continue;
+        };
+        let point = (timeline.share(sample.at), y);
+        match segments.last_mut() {
+            Some(segment) if previous.is_some_and(|p| sample.at.duration_since(p) <= GAP) => {
+                segment.push(point);
+            }
+            _ => segments.push(vec![point]),
+        }
+        previous = Some(sample.at);
+    }
+    segments
 }
 
 /// One cell per column of the chart: the mode the unit ran in, a dot while it was off, nothing
 /// while it was not read.
-fn mode_ribbon(samples: &[&Sample], since: Timestamp, width: u16) -> Line<'static> {
-    let column = DAY / i32::from(width.max(1));
-    let cells = (0..width).map(|index| {
-        let start = since + column * i32::from(index);
-        let state = samples
-            .iter()
-            .rev()
-            .find(|s| s.at < start + column)
-            .filter(|s| start.duration_since(s.at) <= GAP);
-        match state {
+fn mode_ribbon(timeline: &Timeline, samples: &[Sample]) -> Line<'static> {
+    let cells = timeline
+        .columns(samples)
+        .into_iter()
+        .map(|state| match state {
             Some(s) if s.power => Span::styled(
                 "▀",
                 Style::new().fg(Color::Indexed(theme::mode_color(s.mode))),
             ),
             Some(_) => Span::styled("·", DIM),
             None => " ".into(),
-        }
-    });
+        });
     Line::from(cells.collect::<Vec<_>>())
-}
-
-/// Clock hours under the chart, every 6 h where they fit, else every 12 h, with "now" at the
-/// right edge.
-fn time_axis(model: &Model, width: u16) -> Line<'static> {
-    let width = usize::from(width);
-    let every = if width >= 40 { 6 } else { 12 };
-    let since = model.now - DAY;
-    let last = width.saturating_sub(1);
-    let mut marks = vec![(last, "now".to_owned())];
-    let mut hour = since
-        .to_zoned(model.tz.clone())
-        .round(ZonedRound::new().smallest(Unit::Hour).mode(RoundMode::Ceil))
-        .ok();
-    while let Some(at) = hour.take().filter(|at| at.timestamp() < model.now) {
-        if at.hour() % every == 0 {
-            let share = at.timestamp().duration_since(since).as_secs_f64() / DAY.as_secs_f64();
-            marks.push((cell(share, last), at.strftime("%H:%M").to_string()));
-        }
-        hour = at.checked_add(SignedDuration::from_hours(1)).ok();
-    }
-    // Labels are centered on their time; from the right, one that would touch the label after it
-    // is left out, so "now" always shows.
-    marks[1..].sort_by_key(|&(center, _)| std::cmp::Reverse(center));
-    let mut text = vec![' '; width];
-    let mut limit = width;
-    for (center, label) in marks {
-        let start = center
-            .saturating_sub(label.len() / 2)
-            .min(width.saturating_sub(label.len()));
-        if start + label.len() > limit {
-            continue;
-        }
-        for (slot, glyph) in text[start..].iter_mut().zip(label.chars()) {
-            *slot = glyph;
-        }
-        limit = start.saturating_sub(1);
-    }
-    Line::styled(text.into_iter().collect::<String>(), DIM)
 }
 
 /// Splits `text` into lines of at most `width` characters at spaces; a longer word gets its own
@@ -1194,6 +1188,8 @@ mod tests {
                     },
                     target: 22.0,
                     room: 21.0 + wave,
+                    outside: Some(2.0),
+                    fan: Some(FanSpeed::Level(2)),
                 }
             })
             .collect();
@@ -1336,22 +1332,6 @@ mod tests {
         let sweep: Vec<usize> = (0..9).map(|step| lit(step, 0)).collect();
         assert_eq!(sweep, [0, 1, 2, 3, 4, 3, 2, 1, 0]);
         assert_eq!(lit(0, 4), 4, "half a sweep behind starts at the other end");
-    }
-
-    #[test]
-    fn the_time_axis_shows_clock_hours_up_to_now() {
-        let model = lived_in();
-        let axis = |width| time_axis(&model, width).to_string();
-        assert_eq!(axis(30), "12:00          00:00       now");
-        assert_eq!(
-            axis(12),
-            "12:00    now",
-            "an hour too close to now is left out"
-        );
-        assert_eq!(
-            axis(50),
-            "  12:00       18:00       00:00        06:00   now"
-        );
     }
 
     #[test]

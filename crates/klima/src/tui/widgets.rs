@@ -6,6 +6,8 @@ use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
+use crate::chart::cell;
+
 /// A 3×5 pixel font; every pixel is drawn two cells wide so it looks square.
 const FONT: [(char, [&str; 5]); 11] = [
     ('0', ["###", "#.#", "#.#", "#.#", "###"]),
@@ -68,17 +70,6 @@ impl Widget for BigText<'_> {
             x += 2 * u16::try_from(rows[0].len() + 1).unwrap_or(0);
         }
     }
-}
-
-/// The cell for `share` (0 to 1) of a scale whose last cell is `last`.
-#[expect(
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss,
-    clippy::cast_precision_loss,
-    reason = "the share is clamped to 0..=1 and a scale is a few dozen cells"
-)]
-pub fn cell(share: f64, last: usize) -> usize {
-    (share.clamp(0.0, 1.0) * last as f64).round() as usize
 }
 
 /// A scale from `min` to `max` with the target (`●`) and the room temperature (`┃`) on it,

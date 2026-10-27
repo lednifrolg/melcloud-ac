@@ -1,6 +1,6 @@
 //! Private files: owner-only permissions and atomic replacement.
 
-use std::fs::{self, DirBuilder, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::Path;
@@ -40,26 +40,52 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> Result<Option<T>, AppError
 /// Replaces `path` with `value` as JSON. Readers see the old or the new file, never half of
 /// one, and the file is readable only by the owner.
 pub fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
+    replace(path, |file| {
+        serde_json::to_writer_pretty(&mut *file, value)?;
+        file.write_all(b"\n")
+    })
+}
+
+/// Replaces `path` with what `write` puts in a new file, atomically and readable only by the
+/// owner.
+pub fn replace(
+    path: &Path,
+    write: impl FnOnce(&mut File) -> io::Result<()>,
+) -> Result<(), AppError> {
     let dir = parent(path);
     private_dir(dir)?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();
     let temporary = dir.join(format!(".{name}.{}.tmp", std::process::id()));
-    let write = || -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&temporary)?;
-        serde_json::to_writer_pretty(&mut file, value)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)
-    };
-    write().map_err(|e| {
+    let result = OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&temporary)
+        .and_then(|mut file| {
+            write(&mut file)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temporary, path));
+    result.map_err(|e| {
         let _ = fs::remove_file(&temporary);
         AppError::io(path, e)
     })
+}
+
+/// Holds an exclusive lock on the file at `path` until the returned file is dropped; klima
+/// processes take turns on what it guards.
+pub fn lock(path: &Path) -> Result<File, AppError> {
+    private_dir(parent(path))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .map_err(|e| AppError::io(path, e))?;
+    file.lock().map_err(|e| AppError::io(path, e))?;
+    Ok(file)
 }
 
 /// Appends one JSON line to `path`.
