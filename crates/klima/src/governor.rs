@@ -72,7 +72,7 @@ impl fmt::Display for Refusal {
             ),
             Self::TooSoon { next_at } => write!(
                 f,
-                "the unit was read moments ago; next read possible in {} s",
+                "the unit was asked moments ago; next read possible in {} s",
                 seconds_until(*next_at)
             ),
         }

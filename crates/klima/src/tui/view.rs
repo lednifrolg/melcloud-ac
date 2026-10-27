@@ -724,7 +724,7 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
         1 => block = block.title_top(dim_title("1 sample")),
         n => block = block.title_top(dim_title(&format!("{n} samples"))),
     }
-    if samples.len() < 2 {
+    if samples.is_empty() {
         let text = "Every read of the unit adds a sample of the room temperature; the chart fills up over the day.";
         frame.render_widget(
             Paragraph::new(text)
@@ -773,7 +773,13 @@ fn history(model: &Model, frame: &mut Frame, area: Rect) {
     let low = values.iter().copied().fold(f64::INFINITY, f64::min);
     let high = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let mut label_lines = vec![Line::default(); usize::from(labels.height)];
-    if let [first, .., last] = label_lines.as_mut_slice() {
+    if high - low < 0.05 {
+        // A flat line runs mid-height, with its one value beside it.
+        let middle = label_lines.len() / 2;
+        if let Some(line) = label_lines.get_mut(middle) {
+            *line = Line::styled(format!("{high:.1}°"), DIM);
+        }
+    } else if let [first, .., last] = label_lines.as_mut_slice() {
         *first = Line::styled(format!("{high:.1}°"), DIM);
         *last = Line::styled(format!("{low:.1}°"), DIM);
     }
@@ -920,6 +926,9 @@ fn activity(model: &Model, frame: &mut Frame, area: Rect) {
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
+/// A device name in the status line is cut no shorter than this, with "…".
+const SHORTEST_NAME: usize = 12;
+
 fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
     let view = model.state.as_ref().map(|s| s.value.view());
     let color = view.and_then(mode_color).unwrap_or(Color::Indexed(7));
@@ -931,16 +940,16 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
         (Some(_), _) => "LOADING",
         (None, _) => "READY",
     };
-    let name = model.device().map_or("klima", |d| d.name.as_str());
-    let head = vec![
-        Span::styled(format!(" {label} "), BOLD.fg(Color::Black).bg(color)),
-        Span::styled(format!(" {name} "), BOLD.bg(MUTED)),
-    ];
-    // Each segment has the rank it is dropped in when the window is narrow: highest first.
+    let mut name = model
+        .device()
+        .map_or("klima", |d| d.name.as_str())
+        .to_owned();
+    // Each segment has the rank it is dropped in when the window is narrow: highest first. Rank
+    // 0 stays longest, after a long device name has been shortened.
     let mut segments: Vec<(u8, Vec<Span>)> = Vec::new();
     if model.unreachable {
         segments.push((
-            2,
+            0,
             vec![Span::styled("○ MELCloud unreachable", Style::new().fg(BAD))],
         ));
     } else if let Some(view) = view {
@@ -974,8 +983,11 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
     };
     segments.push((4, vec![session]));
 
-    let line = |segments: &[(u8, Vec<Span<'static>>)]| {
-        let mut spans = head.clone();
+    let line = |name: &str, segments: &[(u8, Vec<Span<'static>>)]| {
+        let mut spans = vec![
+            Span::styled(format!(" {label} "), BOLD.fg(Color::Black).bg(color)),
+            Span::styled(format!(" {name} "), BOLD.bg(MUTED)),
+        ];
         for (index, (_, segment)) in segments.iter().enumerate() {
             spans.push(if index == 0 {
                 " ".into()
@@ -986,13 +998,25 @@ fn statusline(model: &Model, frame: &mut Frame, area: Rect) {
         }
         Line::from(spans)
     };
-    while line(&segments).width() > usize::from(area.width) {
-        let Some(least) = (0..segments.len()).max_by_key(|&i| segments[i].0) else {
+    let width = usize::from(area.width);
+    loop {
+        let over = line(&name, &segments).width().saturating_sub(width);
+        if over == 0 {
             break;
-        };
-        segments.remove(least);
+        }
+        let least = (0..segments.len()).max_by_key(|&i| segments[i].0);
+        let length = name.chars().count();
+        match least {
+            Some(i) if segments[i].0 > 0 => drop(segments.remove(i)),
+            _ if length > SHORTEST_NAME => {
+                let keep = length.saturating_sub(over + 1).max(SHORTEST_NAME - 1);
+                name = name.chars().take(keep).chain(['…']).collect();
+            }
+            Some(i) => drop(segments.remove(i)),
+            None => break,
+        }
     }
-    frame.render_widget(line(&segments), area);
+    frame.render_widget(line(&name, &segments), area);
 }
 
 fn refresh_countdown(model: &Model) -> Vec<Span<'static>> {

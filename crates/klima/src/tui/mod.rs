@@ -299,7 +299,11 @@ async fn send(app: &App, device: &Device, changes: ChangeSet, report: impl Fn(Ms
 async fn load_devices(
     app: &App,
 ) -> Result<(Cached<DeviceList>, Option<Cached<AtaState>>), AppError> {
-    let list = app.devices(false).await?;
+    // Without MELCloud, the list from before will do: devices rarely change.
+    let list = match app.devices(false).await {
+        Ok(list) => list,
+        Err(error) => cache::load::<DeviceList>(&app.paths.devices()).ok_or(error)?,
+    };
     let devices = list.value.devices();
     let state = model::choose(devices, app.config.device.as_deref())
         .and_then(|index| cache::load(&app.paths.state_of(devices[index].id)));
@@ -313,15 +317,49 @@ fn failure(error: &AppError) -> Failure {
         AppError::Refused(_) | AppError::Throttled { .. } | AppError::LoginLocked { .. } => {
             FailureKind::Blocked
         }
-        AppError::Api(melcloud::Error::Transport(_)) => FailureKind::Unreachable,
-        AppError::Api(melcloud::Error::Status { status, .. }) if *status >= 500 => {
-            FailureKind::Unreachable
-        }
         _ => FailureKind::Other,
+    };
+    let retry_at = match error {
+        AppError::Refused(Refusal::TooSoon { next_at } | Refusal::HourlyLimit { next_at }) => {
+            Some(*next_at)
+        }
+        AppError::Refused(Refusal::Throttled { until } | Refusal::LoginLocked { until })
+        | AppError::Throttled { until }
+        | AppError::LoginLocked { until } => Some(*until),
+        _ => None,
+    };
+    let unanswered = match error {
+        AppError::Api(melcloud::Error::Transport(_)) => true,
+        AppError::Api(melcloud::Error::Status { status, .. }) => *status >= 500,
+        _ => false,
+    };
+    let reached = match error {
+        _ if unanswered => Some(false),
+        AppError::Usage(_)
+        | AppError::Config { .. }
+        | AppError::Invalid(_)
+        | AppError::Refused(_)
+        | AppError::NotLoggedIn
+        | AppError::Io { .. }
+        | AppError::Corrupt { .. } => None,
+        _ => Some(true),
+    };
+    // The activity log has room for the cause, not for the request's URL.
+    let message = match error {
+        AppError::Api(melcloud::Error::Transport(e)) => {
+            let mut cause: &dyn std::error::Error = e;
+            while let Some(inner) = cause.source() {
+                cause = inner;
+            }
+            format!("could not reach MELCloud: {cause}")
+        }
+        _ => output::message(error),
     };
     Failure {
         kind,
-        message: output::message(error),
+        message,
+        retry_at,
+        reached,
     }
 }
 

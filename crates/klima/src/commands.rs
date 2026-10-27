@@ -202,8 +202,8 @@ pub async fn status(
 }
 
 /// `klima history`: states of the unit read in the last `span`, at most as far back as the
-/// history is kept. Asks MELCloud for nothing, except for the device list when none was ever
-/// fetched.
+/// history is kept. Asks MELCloud for nothing, except for the device list when there is no
+/// cached one that can be read.
 pub async fn history(
     app: &App,
     wanted: Option<&str>,
@@ -224,14 +224,15 @@ pub async fn history(
         .ok()
         .filter(|&since| since >= oldest);
     let since = asked.unwrap_or(oldest);
-    // A little more, so the chart can show the state the unit was in at its left edge.
-    let samples = cache::history(&app.paths, device.id, since - chart::GAP);
+    // Everything kept: the chart starts with the state standing when the window opens, and an
+    // empty window can say when the unit was read last.
+    let samples = cache::history(&app.paths, device.id, oldest - chart::GAP);
     if json {
         output::history_json(device, since, &samples);
     } else {
         let span = match asked {
             Some(_) => format!("{span:#}"),
-            None => format!("{} days, all that is kept", HISTORY_KEPT.as_hours() / 24),
+            None => format!("{}d (all kept)", HISTORY_KEPT.as_hours() / 24),
         };
         let timeline = Timeline {
             since,

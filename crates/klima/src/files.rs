@@ -2,7 +2,7 @@
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::Path;
 
 use serde::Serialize;
@@ -83,18 +83,30 @@ pub fn lock(path: &Path) -> Result<File, AppError> {
     Ok(file)
 }
 
-/// Appends one JSON line to `path`.
+/// Appends one JSON line to `path`. A last line cut short before, by a full disk or a crash, is
+/// ended first, so it does not swallow this one.
 pub fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<(), AppError> {
     private_dir(parent(path))?;
     let mut line = serde_json::to_vec(value).map_err(|e| AppError::io(path, e.into()))?;
     line.push(b'\n');
-    OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .open(path)
-        .and_then(|mut file| file.write_all(&line))
-        .map_err(|e| AppError::io(path, e))
+    let mut append = || -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .mode(0o600)
+            .open(path)?;
+        let length = file.metadata()?.len();
+        if length > 0 {
+            let mut last = [0];
+            file.read_exact_at(&mut last, length - 1)?;
+            if last != *b"\n" {
+                line.insert(0, b'\n');
+            }
+        }
+        file.write_all(&line)
+    };
+    append().map_err(|e| AppError::io(path, e))
 }
 
 /// Deletes `path`; `false` when it did not exist.

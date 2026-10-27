@@ -1,13 +1,19 @@
 //! Text from the server, made safe to show.
 
-/// `text` without control characters, which a terminal could take as commands: escape sequences
-/// can set the clipboard or the window title, for example.
+/// `text` without control characters, which a terminal could take as commands (escape sequences
+/// can set the clipboard or the window title, for example), and without the characters that
+/// reverse the direction of the text after them.
 pub(crate) fn printable(text: String) -> String {
-    if text.chars().any(char::is_control) {
-        text.chars().filter(|c| !c.is_control()).collect()
+    if text.chars().any(unsafe_to_show) {
+        text.chars().filter(|&c| !unsafe_to_show(c)).collect()
     } else {
         text
     }
+}
+
+/// A control character, or a bidirectional embedding, override or isolate.
+pub fn unsafe_to_show(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
 }
 
 #[cfg(test)]
@@ -21,5 +27,11 @@ mod tests {
             printable("Bed\u{1b}]52;c;cHduZWQ=\u{7}room\r\n".into()),
             "Bed]52;c;cHduZWQ=room"
         );
+        assert_eq!(
+            printable("a\u{9b}31mb\u{202e}c".into()),
+            "a31mbc",
+            "C1 and bidi"
+        );
+        assert_eq!(printable("Zoë's café".into()), "Zoë's café");
     }
 }

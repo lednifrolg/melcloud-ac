@@ -31,6 +31,7 @@ use crate::error::AppError;
 #[command(
     name = "klima",
     version,
+    propagate_version = true,
     about,
     after_help = "Without a command, klima opens the interactive TUI."
 )]
@@ -74,7 +75,7 @@ enum Command {
     ///
     /// Every read of the unit, by a command or the TUI, is recorded; the history keeps 90 days.
     History {
-        /// How far back, at most 90 days: 30m, 24h, 7d.
+        /// How far back, up to 90d: 30m, 24h, 7d.
         #[arg(long, default_value = "24h", value_parser = past_span, value_name = "DURATION")]
         since: Span,
     },

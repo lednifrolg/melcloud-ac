@@ -19,10 +19,41 @@ const DAY_MINUTES: i64 = 1440;
 /// What the unit did during one column of a chart.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Column {
-    /// Mean room temperature of the samples in the column.
+    /// Room temperature over the column, each sample weighted by how long it stood.
     pub room: f64,
     /// The mode the unit ran in for most of the column; `None` when it was mostly off.
     pub running: Option<OperationMode>,
+}
+
+/// How times in a span are written, by the calendar days it touches; the same for the axis and
+/// for tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dates {
+    /// All within one day: the clock alone.
+    Clock,
+    /// Within a week: the weekday.
+    Weekday,
+    /// Longer: the date.
+    Date,
+}
+
+impl Dates {
+    /// A day label: "Tue 27", or "Oct 27".
+    pub fn day(self) -> &'static str {
+        match self {
+            Self::Clock | Self::Weekday => "%a %d",
+            Self::Date => "%b %d",
+        }
+    }
+
+    /// A time in a table: "14:05", "Tue 14:05", or "Oct 27 14:05".
+    pub fn time(self) -> &'static str {
+        match self {
+            Self::Clock => "%H:%M",
+            Self::Weekday => "%a %H:%M",
+            Self::Date => "%b %d %H:%M",
+        }
+    }
 }
 
 /// A span of time up to now, drawn `width` columns wide.
@@ -51,26 +82,35 @@ impl Timeline {
         self.since + SignedDuration::from_nanos(i64::try_from(offset).unwrap_or(i64::MAX))
     }
 
-    /// What the unit did in each column, from the samples read in it. A column without samples
-    /// takes the state from the sample before it, unless the unit went unread for longer than
-    /// [`GAP`]; then it is `None`. `samples` are oldest first.
+    /// The calendar days the span touches, as they decide how times are written.
+    pub fn dates(&self, tz: &TimeZone) -> Dates {
+        let first = self.since.to_zoned(tz.clone()).date();
+        let last = self.now.to_zoned(tz.clone()).date();
+        match first.until(last).map(|span| span.get_days()) {
+            Ok(0) => Dates::Clock,
+            Ok(1..=6) => Dates::Weekday,
+            _ => Dates::Date,
+        }
+    }
+
+    /// What the unit did in each column. Each sample stands until the next one, for at most
+    /// [`GAP`]; a column no sample stands in is `None`. `samples` are oldest first.
     pub fn columns(&self, samples: &[Sample]) -> Vec<Option<Column>> {
         (0..self.width)
             .map(|index| {
                 let start = self.column_start(index);
                 let end = self.column_start(index + 1);
-                let first = samples.partition_point(|s| s.at < start);
-                let last = samples.partition_point(|s| s.at < end).max(first);
-                let inside = &samples[first..last];
-                let before = first
-                    .checked_sub(1)
-                    .map(|i| &samples[i..=i])
-                    .filter(|before| start.duration_since(before[0].at) <= GAP);
-                summarize(if inside.is_empty() {
-                    before.unwrap_or_default()
-                } else {
-                    inside
-                })
+                // The last sample before the column may still stand in it.
+                let first = samples.partition_point(|s| s.at < start).saturating_sub(1);
+                let last = samples.partition_point(|s| s.at < end);
+                let stands = (first..last).filter_map(|i| {
+                    let sample = &samples[i];
+                    let until = samples.get(i + 1).map_or(end, |next| next.at);
+                    let until = until.min(sample.at + GAP).min(end);
+                    let seconds = until.duration_since(sample.at.max(start)).as_secs_f64();
+                    (seconds > 0.0).then_some((sample, seconds))
+                });
+                summarize(stands)
             })
             .collect()
     }
@@ -88,7 +128,12 @@ impl Timeline {
             .unwrap_or(LABEL_MINUTES[LABEL_MINUTES.len() - 1]);
         let last = self.width.saturating_sub(1);
         let mut marks = vec![(last, "now".to_owned())];
+        let day = self.dates(tz).day();
+        // Beyond a day, a midnight says which day it starts.
+        let days = self.span() > SignedDuration::from_hours(24);
         let mut mark = |at: &Zoned, format: &str| {
+            let midnight = at.hour() == 0 && at.minute() == 0;
+            let format = if days && midnight { day } else { format };
             let column = cell(self.share(at.timestamp()), last);
             marks.push((column, at.strftime(format).to_string()));
         };
@@ -118,12 +163,6 @@ impl Timeline {
                     .and_then(align);
             }
         } else {
-            // Weekdays within a week, dates beyond.
-            let format = if self.span() <= SignedDuration::from_hours(24 * 7) {
-                "%a %d"
-            } else {
-                "%b %d"
-            };
             let every = step / DAY_MINUTES;
             let mut next = start
                 .round(ZonedRound::new().smallest(Unit::Day).mode(RoundMode::Ceil))
@@ -131,7 +170,7 @@ impl Timeline {
             let mut count = 0;
             while let Some(at) = next.take().filter(before_now) {
                 if count % every == 0 {
-                    mark(&at, format);
+                    mark(&at, day);
                 }
                 count += 1;
                 // From the start of each day, which is not always midnight.
@@ -142,17 +181,24 @@ impl Timeline {
     }
 }
 
-/// The mean room temperature of `samples` and the state they were in most often; `None` when
-/// there are none.
-fn summarize(samples: &[Sample]) -> Option<Column> {
-    let count = u32::try_from(samples.len()).ok().filter(|&n| n > 0)?;
-    let room = samples.iter().map(|s| s.room).sum::<f64>() / f64::from(count);
-    let state = |s: &Sample| s.power.then_some(s.mode);
-    // The latest of the most frequent states wins a tie.
-    let running = samples
-        .iter()
-        .map(state)
-        .max_by_key(|candidate| samples.iter().filter(|s| state(s) == *candidate).count())?;
+/// The room temperature of samples weighted by the seconds each stood, and the state that stood
+/// longest; `None` without any.
+fn summarize<'a>(stands: impl Iterator<Item = (&'a Sample, f64)>) -> Option<Column> {
+    let mut room = 0.0;
+    let mut total = 0.0;
+    let mut states: Vec<(Option<OperationMode>, f64)> = Vec::new();
+    for (sample, seconds) in stands {
+        room += sample.room * seconds;
+        total += seconds;
+        let state = sample.power.then_some(sample.mode);
+        match states.iter_mut().find(|(known, _)| *known == state) {
+            Some((_, time)) => *time += seconds,
+            None => states.push((state, seconds)),
+        }
+    }
+    let (running, _) = states.into_iter().max_by(|a, b| a.1.total_cmp(&b.1))?;
+    // To hundredths, so a flat line stays flat after the arithmetic.
+    let room = (room / total * 100.0).round() / 100.0;
     Some(Column { room, running })
 }
 
@@ -271,9 +317,21 @@ mod tests {
     #[test]
     fn long_spans_are_labelled_by_days_then_dates() {
         assert_eq!(
-            timeline(24 * 7, 60).axis(&TimeZone::UTC),
-            spaced(&[(2, "Fri 09"), (11, "Sun 11"), (11, "Tue 13"), (15, "now")]),
+            timeline(24 * 6, 60).axis(&TimeZone::UTC),
+            spaced(&[(3, "Sat 10"), (13, "Mon 12"), (14, "Wed 14"), (9, "now")]),
             "every other day within a week"
+        );
+        assert_eq!(
+            timeline(24 * 7, 60).axis(&TimeZone::UTC),
+            spaced(&[(2, "Jan 09"), (11, "Jan 11"), (11, "Jan 13"), (15, "now")]),
+            "dates from a week on, as in tables"
+        );
+        let two_days = timeline(48, 80).axis(&TimeZone::UTC);
+        assert!(
+            two_days.contains("Wed 14")
+                && two_days.contains("Thu 15")
+                && two_days.contains("12:00"),
+            "midnights name their day: {two_days}"
         );
         let month = timeline(24 * 30, 60).axis(&TimeZone::UTC);
         assert!(month.starts_with("Dec 17"), "weekly: {month}");
@@ -337,5 +395,37 @@ mod tests {
         assert_eq!(shown, "  ··ccc   ");
         assert_eq!(columns[4].unwrap().room, 22.0, "the mean of 21, 22 and 23");
         assert_eq!(columns[5].unwrap().room, 23.0, "the last sample carries on");
+    }
+
+    #[test]
+    fn a_column_shows_what_stood_longest_not_what_was_read_most() {
+        let off = OperationMode::Heat;
+        let cool = OperationMode::Cool;
+        // Six reads of an off unit in half an hour, then three of it cooling for two hours.
+        let mut samples: Vec<Sample> = (0..6)
+            .map(|i| sample(&format!("2026-01-15T00:{:02}:00Z", i * 5), false, off, 20.0))
+            .collect();
+        for time in ["00:30", "01:15", "02:00"] {
+            samples.push(sample(&format!("2026-01-15T{time}:00Z"), true, cool, 24.0));
+        }
+        let now = at("2026-01-15T03:00:00Z");
+        let one = Timeline {
+            since: now - SignedDuration::from_hours(3),
+            now,
+            width: 1,
+        };
+        let column = one.columns(&samples)[0].unwrap();
+        assert_eq!(column.running, Some(cool));
+        // 30 min at 20 °C and 135 min at 24 °C.
+        assert_eq!(column.room, 23.27);
+    }
+
+    #[test]
+    fn dates_follow_the_calendar_days_of_the_span() {
+        let zone = TimeZone::UTC;
+        assert_eq!(timeline(1, 60).dates(&zone), Dates::Clock);
+        assert_eq!(timeline(24, 60).dates(&zone), Dates::Weekday);
+        assert_eq!(timeline(24 * 6, 60).dates(&zone), Dates::Weekday);
+        assert_eq!(timeline(24 * 7, 60).dates(&zone), Dates::Date);
     }
 }

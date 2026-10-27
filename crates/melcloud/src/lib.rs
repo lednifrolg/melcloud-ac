@@ -19,6 +19,8 @@ mod flags;
 mod text;
 mod time;
 
+pub use text::unsafe_to_show;
+
 pub use ata::{
     AtaState, AtaView, FanSpeed, NO_ERROR, OperationMode, ParseValueError, VaneHorizontal,
     VaneVertical, WeatherKind, WeatherObservation,

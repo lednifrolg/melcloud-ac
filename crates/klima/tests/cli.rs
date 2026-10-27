@@ -446,7 +446,10 @@ async fn history_charts_the_day_and_lists_the_changes_without_reading_the_unit()
         band.trim_end().ends_with("······hhhhhhcccc"),
         "letters tell the modes apart without colors: {text}"
     );
-    assert!(text.contains("now\n\nFROM "), "{text}");
+    assert!(
+        text.contains("now\n     h heat  c cool  · off  blank: not read\n\nFROM "),
+        "a legend of what the band shows: {text}"
+    );
     let changes: Vec<&str> = text
         .lines()
         .skip_while(|line| !line.starts_with("FROM"))
@@ -457,23 +460,23 @@ async fn history_charts_the_day_and_lists_the_changes_without_reading_the_unit()
         "header, the first state and three changes: {text}"
     );
     assert!(
-        changes[0].ends_with("POWER  MODE   TARGET  FAN      ROOM"),
+        changes[0].ends_with("POWER  MODE  TARGET  FAN    ROOM"),
         "{text}"
     );
     assert!(
-        changes[1].ends_with("off    heat  22.0 °C  auto  21.5 °C"),
+        changes[1].ends_with("off    heat   22.0°  auto  21.5°"),
         "{text}"
     );
     assert!(
-        changes[2].ends_with("on     heat  22.0 °C  auto  21.5 °C"),
+        changes[2].ends_with("on     heat   22.0°  auto  21.5°"),
         "{text}"
     );
     assert!(
-        changes[3].ends_with("on     heat  23.5 °C  auto  21.5 °C"),
+        changes[3].ends_with("on     heat   23.5°  auto  21.5°"),
         "{text}"
     );
     assert!(
-        changes[4].ends_with("on     cool  23.5 °C  auto  21.5 °C"),
+        changes[4].ends_with("on     cool   23.5°  auto  21.5°"),
         "{text}"
     );
     assert_eq!(klima.requests_to("/Device/Get").await, 0);
@@ -527,7 +530,7 @@ async fn history_lists_the_latest_changes_and_counts_the_rest() {
 
     assert_eq!(code(&output), 0, "{}", stderr(&output));
     assert!(
-        stderr(&output).contains("10 earlier changes left out; --json lists every sample"),
+        stderr(&output).contains("10 earlier changes hidden; --json has all"),
         "{}",
         stderr(&output)
     );
@@ -537,10 +540,7 @@ async fn history_lists_the_latest_changes_and_counts_the_rest() {
         .skip_while(|line| !line.starts_with("FROM"))
         .count();
     assert_eq!(rows, 21, "header and 20 rows: {text}");
-    assert!(
-        text.trim_end().ends_with("34.5 °C  auto  21.5 °C"),
-        "{text}"
-    );
+    assert!(text.trim_end().ends_with("34.5°  auto  21.5°"), "{text}");
 }
 
 #[tokio::test(flavor = "multi_thread")]

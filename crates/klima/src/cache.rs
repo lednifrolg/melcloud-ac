@@ -145,14 +145,20 @@ pub fn record_history(paths: &Paths, view: &AtaView, now: Timestamp) -> Result<(
         error_code: view.error_code,
         error_message: view.error_message.as_deref(),
     };
+    // The unit's last contact comes from MELCloud's clock, so a local clock far ahead does not
+    // make the whole history look too old.
+    let reference = view.last_communication.map_or(now, |contact| {
+        now.min(contact + SignedDuration::from_hours(24))
+    });
     let _lock = files::lock(&paths.history_lock())?;
-    let pruned = prune_history(&paths.history(), now);
+    let pruned = prune_history(&paths.history(), reference);
     append_json_line(&paths.history(), &record)?;
     pruned
 }
 
-/// Drops states older than [`HISTORY_KEPT`] once the oldest is a day past it, so the file is
-/// rewritten about once a day. Lines that cannot be read go too. Runs under the history lock.
+/// Drops states older than [`HISTORY_KEPT`] before `now` once the oldest is a day past it, so the
+/// file is rewritten about once a day. Lines that cannot be read go too. Runs under the history
+/// lock.
 fn prune_history(path: &Path, now: Timestamp) -> Result<(), AppError> {
     #[derive(Deserialize)]
     struct Stored {
@@ -283,17 +289,39 @@ mod tests {
     #[test]
     fn a_clock_far_ahead_does_not_empty_the_history() {
         let home = tempfile::tempdir().unwrap();
-        let path = home.path().join("history.jsonl");
-        let now: Timestamp = "2026-06-01T12:00:00Z".parse().unwrap();
+        let paths = Paths::under(home.path());
+        let state: melcloud::AtaState =
+            serde_json::from_str(include_str!("../../melcloud/tests/data/device-get.json"))
+                .unwrap();
+        let contact = state.view().last_communication.unwrap();
         let lines = format!(
             "{}\n{}\n",
-            json!({"at": now - SignedDuration::from_hours(24 * 30), "device": 1}),
-            json!({"at": now, "device": 1}),
+            json!({"at": contact - SignedDuration::from_hours(24 * 60), "device": 1}),
+            json!({"at": contact, "device": 1}),
         );
-        std::fs::write(&path, &lines).unwrap();
-        let wrong = now + SignedDuration::from_hours(24 * 200);
-        prune_history(&path, wrong).unwrap();
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), lines);
+        std::fs::create_dir_all(paths.history().parent().unwrap()).unwrap();
+        std::fs::write(paths.history(), &lines).unwrap();
+
+        // Two reads, as a TUI makes them, with the clock 200 days ahead.
+        let wrong = contact + SignedDuration::from_hours(24 * 200);
+        record_history(&paths, state.view(), wrong).unwrap();
+        record_history(&paths, state.view(), wrong + SignedDuration::from_mins(10)).unwrap();
+        let text = std::fs::read_to_string(paths.history()).unwrap();
+        assert!(text.starts_with(&lines), "{text}");
+        assert_eq!(text.lines().count(), 4);
+    }
+
+    #[test]
+    fn a_line_cut_short_does_not_swallow_the_next() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("history.jsonl");
+        std::fs::write(&path, "{\"at\":\"2026-01-15T09:00:00Z\",\"pow").unwrap();
+        append_json_line(&path, &json!({"at": "2026-01-15T09:10:00Z"})).unwrap();
+        append_json_line(&path, &json!({"at": "2026-01-15T09:20:00Z"})).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(lines[1], r#"{"at":"2026-01-15T09:10:00Z"}"#);
     }
 
     #[test]
