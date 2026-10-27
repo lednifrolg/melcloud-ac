@@ -11,6 +11,8 @@ mod governor;
 mod output;
 mod paths;
 mod session;
+mod theme;
+mod tui;
 
 use std::process::ExitCode;
 
@@ -22,7 +24,12 @@ use crate::control::{Options, Power, Temperature, Wanted};
 use crate::error::AppError;
 
 #[derive(Debug, Parser)]
-#[command(name = "klima", version, about, arg_required_else_help = true)]
+#[command(
+    name = "klima",
+    version,
+    about,
+    after_help = "Without a command, klima opens the interactive TUI."
+)]
 struct Cli {
     /// Device name or ID; needed when the account has more than one.
     #[arg(short, long, global = true)]
@@ -31,7 +38,7 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -206,10 +213,13 @@ fn wanted(command: &Command) -> Option<(Wanted, Options)> {
 
 async fn run(cli: Cli) -> Result<(), AppError> {
     let app = App::new()?;
-    if let Some((wanted, options)) = wanted(&cli.command) {
+    let Some(command) = cli.command else {
+        return tui::run(app).await;
+    };
+    if let Some((wanted, options)) = wanted(&command) {
         return control::run(&app, cli.device.as_deref(), wanted, options, cli.json).await;
     }
-    match cli.command {
+    match command {
         Command::Login {
             email,
             password_stdin,
