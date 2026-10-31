@@ -1,8 +1,10 @@
 //! Private files: owner-only permissions and atomic replacement.
+//!
+//! On Windows, files and directories take the access rules of the directory they are made in;
+//! those of the user profile, where klima keeps its files, admit only the owner.
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io::{self, Write};
-use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use serde::Serialize;
@@ -12,11 +14,18 @@ use crate::error::AppError;
 
 /// Creates `dir` and its parents, readable only by the owner.
 pub fn private_dir(dir: &Path) -> Result<(), AppError> {
-    DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|e| AppError::io(dir, e))
+    let mut builder = DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder.create(dir).map_err(|e| AppError::io(dir, e))
+}
+
+/// Opens `path` with `options`, creating it readable only by the owner.
+fn open_private(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(options, 0o600);
+    options.create(true).open(path)
 }
 
 fn parent(path: &Path) -> &Path {
@@ -62,22 +71,23 @@ pub fn replace(
     write(temporary.as_file_mut())
         .and_then(|()| temporary.as_file().sync_all())
         .map_err(|e| AppError::io(path, e))?;
-    temporary
-        .persist(path)
+    // Renamed by std rather than `persist`: on Windows, std replaces a file that another process
+    // has open, as a TUI has the ledger, where `persist` fails with "access denied".
+    let temporary = temporary
+        .into_temp_path()
+        .keep()
         .map_err(|e| AppError::io(path, e.error))?;
-    Ok(())
+    fs::rename(&temporary, path).map_err(|e| {
+        let _ = fs::remove_file(&temporary);
+        AppError::io(path, e)
+    })
 }
 
 /// Holds an exclusive lock on the file at `path` until the returned file is dropped; klima
 /// processes take turns on what it guards.
 pub fn lock(path: &Path) -> Result<File, AppError> {
     private_dir(parent(path))?;
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .mode(0o600)
-        .open(path)
+    let file = open_private(path, OpenOptions::new().truncate(false).write(true))
         .map_err(|e| AppError::io(path, e))?;
     file.lock().map_err(|e| AppError::io(path, e))?;
     Ok(file)
@@ -90,16 +100,12 @@ pub fn append_json_line<T: Serialize>(path: &Path, value: &T) -> Result<(), AppE
     let mut line = serde_json::to_vec(value).map_err(|e| AppError::io(path, e.into()))?;
     line.push(b'\n');
     let mut append = || -> io::Result<()> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .mode(0o600)
-            .open(path)?;
-        let length = file.metadata()?.len();
-        if length > 0 {
+        let mut file = open_private(path, OpenOptions::new().read(true).append(true))?;
+        if file.metadata()?.len() > 0 {
+            // Seeking leaves appending alone: every write goes to the end.
             let mut last = [0];
-            file.read_exact_at(&mut last, length - 1)?;
+            file.seek(SeekFrom::End(-1))?;
+            file.read_exact(&mut last)?;
             if last != *b"\n" {
                 line.insert(0, b'\n');
             }
@@ -120,8 +126,6 @@ pub fn remove(path: &Path) -> Result<bool, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::PermissionsExt;
-
     use super::*;
 
     #[test]
@@ -131,16 +135,31 @@ mod tests {
         write_json(&path, &vec![1, 2, 3]).unwrap();
 
         assert_eq!(read_json::<Vec<i32>>(&path).unwrap(), Some(vec![1, 2, 3]));
-        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
-        let dir_mode = fs::metadata(path.parent().unwrap())
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777;
-        assert_eq!(dir_mode, 0o700);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&path), 0o600);
+            assert_eq!(mode(path.parent().unwrap()), 0o700);
+        }
         let leftovers = fs::read_dir(path.parent().unwrap()).unwrap().count();
         assert_eq!(leftovers, 1, "temporary file left behind");
+    }
+
+    #[test]
+    fn a_file_is_replaced_while_a_reader_holds_it_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("value.json");
+        write_json(&path, &1).unwrap();
+        let mut reader = File::open(&path).unwrap();
+
+        write_json(&path, &2).unwrap();
+
+        assert_eq!(read_json::<i32>(&path).unwrap(), Some(2));
+        let mut old = String::new();
+        reader.read_to_string(&mut old).unwrap();
+        assert_eq!(old, "1\n");
     }
 
     #[test]

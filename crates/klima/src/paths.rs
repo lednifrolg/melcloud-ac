@@ -8,8 +8,8 @@ use melcloud::DeviceId;
 
 use crate::error::AppError;
 
-/// `<value>/klima` when the XDG variable holds an absolute path, else `<home>/<fallback>/klima`.
-fn xdg(value: Option<OsString>, home: &Path, fallback: &str) -> PathBuf {
+/// `<value>/klima` when the variable holds an absolute path, else `<home>/<fallback>/klima`.
+fn base(value: Option<OsString>, home: &Path, fallback: &str) -> PathBuf {
     value
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
@@ -26,8 +26,7 @@ pub struct Paths {
 }
 
 impl Paths {
-    /// XDG locations (`~/.config/klima`, `~/.local/state/klima`, `~/.cache/klima`), or all three
-    /// under `KLIMA_HOME` when it is set.
+    /// The usual locations of the system, or all three under `KLIMA_HOME` when it is set.
     pub fn discover() -> Result<Self, AppError> {
         if let Some(home) = env::var_os("KLIMA_HOME") {
             return Ok(Self::under(Path::new(&home)));
@@ -35,11 +34,29 @@ impl Paths {
         let home = env::home_dir()
             .filter(|home| home.is_absolute())
             .ok_or_else(|| AppError::Usage("cannot find the home directory".into()))?;
-        Ok(Self {
-            config: xdg(env::var_os("XDG_CONFIG_HOME"), &home, ".config"),
-            state: xdg(env::var_os("XDG_STATE_HOME"), &home, ".local/state"),
-            cache: xdg(env::var_os("XDG_CACHE_HOME"), &home, ".cache"),
-        })
+        Ok(Self::of_system(&home))
+    }
+
+    /// XDG locations: `~/.config/klima`, `~/.local/state/klima` and `~/.cache/klima`.
+    #[cfg(not(windows))]
+    fn of_system(home: &Path) -> Self {
+        Self {
+            config: base(env::var_os("XDG_CONFIG_HOME"), home, ".config"),
+            state: base(env::var_os("XDG_STATE_HOME"), home, ".local/state"),
+            cache: base(env::var_os("XDG_CACHE_HOME"), home, ".cache"),
+        }
+    }
+
+    /// The config in `%APPDATA%\klima`, which may roam with the user; state and cache, which
+    /// belong to this computer, in `%LOCALAPPDATA%\klima`.
+    #[cfg(windows)]
+    fn of_system(home: &Path) -> Self {
+        let local = base(env::var_os("LOCALAPPDATA"), home, r"AppData\Local");
+        Self {
+            config: base(env::var_os("APPDATA"), home, r"AppData\Roaming"),
+            state: local.join("state"),
+            cache: local.join("cache"),
+        }
     }
 
     pub fn under(home: &Path) -> Self {
@@ -88,19 +105,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn xdg_variables_win_only_with_absolute_paths() {
-        let home = Path::new("/home/user");
+    fn variables_win_only_with_absolute_paths() {
+        let root = Path::new(if cfg!(windows) { r"C:\" } else { "/" });
+        let home = root.join("home");
         assert_eq!(
-            xdg(Some("/xdg/state".into()), home, ".local/state"),
-            Path::new("/xdg/state/klima")
+            base(Some(root.join("state").into()), &home, "fallback"),
+            root.join("state/klima")
         );
         assert_eq!(
-            xdg(Some("relative".into()), home, ".local/state"),
-            Path::new("/home/user/.local/state/klima")
+            base(Some("relative".into()), &home, "fallback"),
+            home.join("fallback/klima")
         );
-        assert_eq!(
-            xdg(None, home, ".cache"),
-            Path::new("/home/user/.cache/klima")
-        );
+        assert_eq!(base(None, &home, "fallback"), home.join("fallback/klima"));
     }
 }
