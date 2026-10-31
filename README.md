@@ -1,8 +1,8 @@
 # melcloud-ac
 
 `klima` is a terminal client for Mitsubishi Electric air conditioners on the classic MELCloud
-service (`app.melcloud.com`): an interactive TUI and one-shot commands for the shell, on Linux
-and macOS.
+service (`app.melcloud.com`): an interactive TUI and one-shot commands for the shell, on Linux,
+macOS and Windows.
 
 Unofficial project, not affiliated with Mitsubishi Electric. It talks to an undocumented API
 and controls a real device on a real account.
@@ -25,9 +25,27 @@ tar -xzf "klima-$target.tar.gz"
 mkdir -p ~/.local/bin && install -m 755 "klima-$target/klima" ~/.local/bin/
 ```
 
-The archive also holds shell completions and man pages; `klima completions <shell>` and
-`klima man <dir>` write the same files. With the GitHub CLI, this checks that the archive was
-built by this repository's release workflow:
+On Windows, in PowerShell:
+
+```powershell
+# x86_64-pc-windows-msvc, or aarch64-pc-windows-msvc on ARM
+$target = "x86_64-pc-windows-msvc"
+$latest = "https://github.com/lednifrolg/melcloud-ac/releases/latest/download"
+curl.exe -fsSLO "$latest/klima-$target.zip"
+tar.exe -xf "klima-$target.zip"
+$bin = "$env:LOCALAPPDATA\Programs\klima"
+New-Item -ItemType Directory -Force $bin | Out-Null
+Copy-Item "klima-$target\klima.exe" $bin
+# Once: add it to your PATH, then open a new terminal
+$path = [Environment]::GetEnvironmentVariable("Path", "User")
+[Environment]::SetEnvironmentVariable("Path", "$path;$bin", "User")
+```
+
+The archives also hold shell completions and, except on Windows, man pages;
+`klima completions <shell>` and `klima man <dir>` write the same files. In PowerShell, add
+`klima completions powershell | Out-String | Invoke-Expression` to your `$PROFILE`. With the
+GitHub CLI, this checks that the archive was built by this repository's release workflow (on
+Windows, for the `.zip` and on one line):
 
 ```sh
 gh attestation verify "klima-$target.tar.gz" --repo lednifrolg/melcloud-ac \
@@ -67,7 +85,8 @@ For window manager key bindings, see [Hyprland and Omarchy](docs/hyprland.md).
 
 ## Configuration
 
-With several devices, pick one with `--device <name or ID>` or in `~/.config/klima/config.toml`:
+With several devices, pick one with `--device <name or ID>` or in `~/.config/klima/config.toml`
+(`%APPDATA%\klima\config.toml` on Windows):
 
 ```toml
 device = "Living room"
@@ -77,7 +96,9 @@ animations = true            # spinning fan, swinging vanes, flashing digits in 
 ```
 
 The session, request ledger and history live in `~/.local/state/klima`, the last server
-responses in `~/.cache/klima`. `KLIMA_HOME` puts config, state and cache in one directory.
+responses in `~/.cache/klima`; on Windows in `%LOCALAPPDATA%\klima\state` and `\cache`.
+`KLIMA_HOME` puts config, state and cache in one directory. On Windows, the access rules of your
+user profile keep these files private; a `KLIMA_HOME` outside it gets the rules of its directory.
 
 ## Request budget
 
