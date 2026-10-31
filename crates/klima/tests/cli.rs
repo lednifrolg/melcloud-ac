@@ -75,26 +75,30 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     files
 }
 
-#[cfg(unix)]
-#[tokio::test(flavor = "multi_thread")]
-async fn files_follow_the_xdg_directories() {
-    let klima = Klima::new().await;
+/// Logs in without `KLIMA_HOME`, so klima uses the locations of the system that `configure`
+/// points elsewhere, and takes the email from the config at `config`.
+async fn login_without_klima_home(
+    klima: &Klima,
+    config: &std::path::Path,
+    configure: impl FnOnce(&mut Command) -> &mut Command,
+) {
     Mock::given(path("/Login/ClientLogin3"))
         .respond_with(json_response(&login_response(SignedDuration::from_hours(
             1,
         ))))
         .mount(&klima.server)
         .await;
-    let home = klima.home.path();
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(config, format!("email = \"{EMAIL}\"\n")).unwrap();
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_klima"))
-        .args(["login", "--email", EMAIL, "--password-stdin"])
-        .env_remove("KLIMA_HOME")
-        .env_remove("XDG_CONFIG_HOME")
-        .env_remove("XDG_CACHE_HOME")
-        .env("HOME", home.join("home"))
-        .env("XDG_STATE_HOME", home.join("xdg-state"))
-        .env("KLIMA_API_URL", klima.server.uri())
+    let mut command = Command::new(env!("CARGO_BIN_EXE_klima"));
+    configure(
+        command
+            .args(["login", "--password-stdin"])
+            .env_remove("KLIMA_HOME")
+            .env("KLIMA_API_URL", klima.server.uri()),
+    );
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -108,10 +112,45 @@ async fn files_follow_the_xdg_directories() {
         .await
         .unwrap();
     let output = child.wait_with_output().await.unwrap();
-
     assert!(output.status.success(), "{}", stderr(&output));
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn files_follow_the_xdg_directories() {
+    let klima = Klima::new().await;
+    let home = klima.home.path();
+
+    let config = home.join("home/.config/klima/config.toml");
+    login_without_klima_home(&klima, &config, |command| {
+        command
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_CACHE_HOME")
+            .env("HOME", home.join("home"))
+            .env("XDG_STATE_HOME", home.join("xdg-state"))
+    })
+    .await;
+
     assert!(home.join("xdg-state/klima/session.json").exists());
     assert!(home.join("xdg-state/klima/ledger.json").exists());
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn files_follow_the_app_data_directories() {
+    let klima = Klima::new().await;
+    let home = klima.home.path();
+
+    let config = home.join(r"roaming\klima\config.toml");
+    login_without_klima_home(&klima, &config, |command| {
+        command
+            .env("APPDATA", home.join("roaming"))
+            .env("LOCALAPPDATA", home.join("local"))
+    })
+    .await;
+
+    assert!(home.join(r"local\klima\state\session.json").exists());
+    assert!(home.join(r"local\klima\state\ledger.json").exists());
 }
 
 #[tokio::test(flavor = "multi_thread")]
