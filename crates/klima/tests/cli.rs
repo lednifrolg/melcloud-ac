@@ -1,7 +1,6 @@
 //! End to end: the real `klima` binary against a mock MELCloud.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 
 use jiff::{SignedDuration, Timestamp};
@@ -43,11 +42,16 @@ async fn login_stores_the_session_but_never_the_password() {
         stdout(&output)
     );
     assert!(stdout(&output).contains("(30 days)"), "{}", stdout(&output));
-    let session = klima.file("state/session.json");
-    assert_eq!(
-        fs::metadata(&session).unwrap().permissions().mode() & 0o777,
-        0o600
-    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let session = klima.file("state/session.json");
+        assert_eq!(
+            fs::metadata(&session).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
     for entry in walk(klima.home.path()) {
         let content = fs::read_to_string(&entry).unwrap_or_default();
         assert!(
@@ -71,6 +75,7 @@ fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     files
 }
 
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn files_follow_the_xdg_directories() {
     let klima = Klima::new().await;
