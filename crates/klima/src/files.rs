@@ -71,10 +71,16 @@ pub fn replace(
     write(temporary.as_file_mut())
         .and_then(|()| temporary.as_file().sync_all())
         .map_err(|e| AppError::io(path, e))?;
-    temporary
-        .persist(path)
+    // Renamed by std rather than `persist`: on Windows, std replaces a file that another process
+    // has open, as a TUI has the ledger, where `persist` fails with "access denied".
+    let temporary = temporary
+        .into_temp_path()
+        .keep()
         .map_err(|e| AppError::io(path, e.error))?;
-    Ok(())
+    fs::rename(&temporary, path).map_err(|e| {
+        let _ = fs::remove_file(&temporary);
+        AppError::io(path, e)
+    })
 }
 
 /// Holds an exclusive lock on the file at `path` until the returned file is dropped; klima
