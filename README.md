@@ -55,7 +55,7 @@ gh attestation verify "klima-$target.tar.gz" --repo lednifrolg/melcloud-ac \
 From source, with a recent Rust:
 
 ```sh
-cargo install --git https://github.com/lednifrolg/melcloud-ac --tag v0.1.0 --locked klima
+cargo install --git https://github.com/lednifrolg/melcloud-ac --tag v0.2.0 --locked klima
 ```
 
 ## Usage
